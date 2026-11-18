@@ -1,7 +1,8 @@
 /* =========================================================
    Eclipse Cortinas — gerador de orçamento em PDF (página interna)
-   Os modelos e preços são lidos do simulador do index.html,
-   então basta atualizar os preços no site.
+   Base: gerador da EDD Cortinas. Os modelos vêm do simulador do index.html; os preços do
+   gerador ficam aqui (PRECOS: preço base de cada modelo) e na js/tabela-tecidos.js
+   (coleções, linhos e adicionais), todos = tabela da EDD Cortinas + 20%.
    ========================================================= */
 
 const EMPRESA = {
@@ -13,7 +14,27 @@ const EMPRESA = {
     "CNPJ 04.154.413/0001-81",
   ],
   site: "eclipsecortinas.com.br",
+  telefone: "(85) 9 8423-1563",
   logo: "img/logo-eclipse-cortinas.png",
+};
+
+/* Preço base de cada modelo no gerador (usado quando o item não tem coleção escolhida):
+   tabela da EDD Cortinas + 20%, arredondado ao centavo (R$/m², R$/m na cortina de tecido).
+   O que não estiver aqui usa o data-preco do simulador do index.html. */
+const PRECOS = {
+  "Cortina de tecido":                  { preco: 120.00 },
+  "Cortina de tecido com blackout":     { preco: 208.69 },
+  "Cortina rolô":                       { preco: 281.40, guia: 132.00 },
+  "Cortina romana":                     { preco: 433.55 },
+  "Cortina painel":                     { preco: 228.55 },
+  "Cortina double vision":              { preco: 517.44 },
+  "Cortina motorizada":                 { preco: 310.80, acessorios: 1464.00 },
+  "Persiana vertical de tecido":        { preco: 203.88 },
+  "Persiana vertical de PVC":           { preco: 280.80 },
+  "Persiana horizontal 25 mm":          { preco: 291.20 },
+  "Persiana horizontal 50 mm alumínio": { preco: 571.51 },
+  "Persiana horizontal 50 mm madeira":  { preco: 1312.51 },
+  "Toldo vertical (tela screen 5%)":    { preco: 600.00, acessorios: 720.00 },
 };
 
 const CONSIDERACOES_PADRAO = [
@@ -31,7 +52,15 @@ const TECIDO_FRANZIDO = 3;
 const CHAVE_RASCUNHO = "eclipse-orcamento-rascunho";
 // Cada link de pedido tem o próprio rascunho; sem link, usa o rascunho geral
 let chaveRascunho = CHAVE_RASCUNHO;
-const CHAVE_ULTIMO = "eclipse-orcamento-ultimo-numero";
+
+/* Numeração: ORC 10/26-001 (orçamento) e PED 10/26-001 (pedido); todo mês recomeça do 001.
+   O próximo número vem do "servidor" (na Eclipse, por enquanto, a lista salva neste aparelho). */
+const PREFIXO_NUMERO = { "Orçamento": "ORC", "Pedido": "PED" };
+const RE_NUMERO = /^(ORC|PED) (\d{2})\/(\d{2})-(\d+)$/;
+function baseNumero(tipo, data) {
+  const d = /^\d{4}-\d{2}-\d{2}$/.test(data || "") ? data : hoje();
+  return `${PREFIXO_NUMERO[tipo === "Pedido" ? "Pedido" : "Orçamento"]} ${d.slice(5, 7)}/${d.slice(2, 4)}-`;
+}
 
 /* Condições comerciais
    - Validade do orçamento: dias corridos a partir da data
@@ -89,6 +118,13 @@ function soNumerosDecimal(campo) {
   v = b.length ? `${a},${b.join("").slice(0, 2)}` : a;
   if (v !== campo.value) campo.value = v;
 }
+// Valores em R$: o ponto é separador de milhar ("1.200,23"), então é ignorado
+function soValorEmReais(campo) {
+  let v = campo.value.replace(/\./g, "").replace(/[^\d,]/g, "");
+  const [a, ...b] = v.split(",");
+  v = b.length ? `${a},${b.join("").slice(0, 2)}` : a;
+  if (v !== campo.value) campo.value = v;
+}
 function soInteiros(campo) {
   const v = campo.value.replace(/\D/g, "");
   if (v !== campo.value) campo.value = v;
@@ -107,23 +143,94 @@ async function carregarModelos() {
     const html = await (await fetch("index.html", { cache: "no-store" })).text();
     const doc = new DOMParser().parseFromString(html, "text/html");
     doc.querySelectorAll("#sim-modelo option[data-preco]").forEach((op) => {
+      const nome = op.textContent.trim();
+      const p = PRECOS[nome] || {};
       MODELOS.push({
-        nome: op.textContent.trim(),
+        nome,
         grupo: op.parentElement.tagName === "OPTGROUP" ? op.parentElement.label : "Modelos",
-        preco: parseFloat(op.dataset.preco) || 0,
+        preco: p.preco || parseFloat(op.dataset.preco) || 0,
         calculo: op.dataset.calculo || "",
         alturamax: parseFloat(op.dataset.alturamax) || 2.8,
-        acessorios: parseFloat(op.dataset.acessorios) || 0,
+        acessorios: p.acessorios || parseFloat(op.dataset.acessorios) || 0,
         acessoriosNome: op.dataset.acessoriosNome || "acessórios",
-        guia: parseFloat(op.dataset.guia) || 0,
+        guia: p.guia || parseFloat(op.dataset.guia) || 0,
         prazo: parseInt(op.dataset.prazo, 10) || 0,
       });
     });
   } catch (e) {
     console.warn("Não foi possível ler os modelos do site", e);
   }
+  // Tecidos da tabela (js/tabela-tecidos.js): coleções, opções (tubo/vias), cores e adicionais de cada modelo
+  if (typeof TABELA_TECIDOS !== "undefined") {
+    Object.entries(TABELA_TECIDOS).forEach(([nome, tabela]) => {
+      let m = MODELOS.find((x) => x.nome === nome);
+      if (!m) {
+        // Modelo que só o gerador tem (ex.: painel romano, acortinado): entra logo depois do
+        // modelo indicado em "depoisDe" (sem ele, depois do painel)
+        const ref = MODELOS.find((x) => x.nome === (tabela.depoisDe || "Cortina painel"));
+        m = { nome, grupo: ref ? ref.grupo : "Cortinas", preco: 0, calculo: tabela.calculo || "", alturamax: tabela.alturamax || 2.8, acessorios: 0, guia: 0, prazo: ref ? ref.prazo : 10 };
+        MODELOS.splice(ref ? MODELOS.indexOf(ref) + 1 : MODELOS.length, 0, m);
+      }
+      m.tabela = tabela;
+    });
+  }
   MODELOS.push({ nome: "Kit instalação", grupo: "Outros (valor fixo)", preco: 0, fixo: true });
   MODELOS.push({ nome: "Serviço / outro item", grupo: "Outros (valor fixo)", preco: 0, fixo: true });
+}
+
+/* Tabela de tecidos do item: coleção (categoria), opção (tubo/vias), cor e adicionais */
+const colecaoDe = (m, nome) => (m && m.tabela && nome ? m.tabela.colecoes.find((c) => c.nome === nome) : null);
+// Opção usada (índice no preço da coleção): a escolhida ou, na rolô em "Automático",
+// R32 até 3,20 m² e 2,00 m de largura e R38 acima disso
+function varianteUsada(m, dados) {
+  const v = m && m.tabela && m.tabela.variante;
+  if (!v) return 0;
+  const i = v.opcoes.indexOf(dados.variante);
+  if (i >= 0) return i;
+  if (v.automatica === "rolo") {
+    const l = lerMedida(dados.largura), h = lerMedida(dados.altura);
+    return l * h > 3.2 || l > 2 ? 1 : 0;
+  }
+  return 0;
+}
+// Preço do m² na tabela de hoje: o da coleção (na opção usada) ou, sem coleção, o preço base do modelo
+function precoTabela(m, dados) {
+  const c = colecaoDe(m, dados.categoria);
+  return c ? c.precos[varianteUsada(m, dados)] || c.precos[0] : m.preco;
+}
+// Muda quando muda o que define o preço (modelo, coleção ou opção): aí o item pega o preço de hoje
+const chavePreco = (m, dados) => (m ? `${m.nome}|${dados.categoria || ""}|${varianteUsada(m, dados)}` : "");
+function adicionaisDe(m, dados) {
+  const ids = String(dados.adicionais || "").split(",").filter(Boolean);
+  return ((m && m.tabela && m.tabela.adicionais) || []).filter((a) => ids.includes(a.id));
+}
+// Franzimento da cortina de tecido: o escolhido no item (linhos: 2,00 a 4,00) ou o padrão da linha
+// (3,00 nos linhos, 2,50 no Acortinado BK). Guardado como texto "3,30".
+function franzimentoUsado(m, dados) {
+  const t = m && m.tabela;
+  const padrao = (t && t.franzido) || TECIDO_FRANZIDO;
+  const opcoes = (t && t.franzimentos) || [];
+  const n = parseFloat(String(dados.franzimento || "").replace(",", "."));
+  return opcoes.some((o) => Math.abs(o - n) < 1e-9) ? n : padrao;
+}
+// "franzimento 3,30 (2,00 x 3,30 = 6,60 m)": vai no PDF junto do tecido
+function textoFranzimento(m, dados) {
+  const f = franzimentoUsado(m, dados);
+  const l = lerMedida(dados.largura);
+  return `franzimento ${numero.format(f)}` + (l ? ` (${numero.format(l)} x ${numero.format(f)} = ${numero.format(l * f)} m)` : "");
+}
+// "Coleção Screen 3% - tubo R38 - cor 701" (vai no PDF e na conta do item)
+function textoTecido(m, dados) {
+  const c = colecaoDe(m, dados.categoria);
+  const v = m && m.tabela && m.tabela.variante;
+  const opcao = c && v ? v.opcoes[varianteUsada(m, dados)] : "";
+  return [
+    dados.categoria && (m && m.tabela && m.tabela.rotulo === "Tecido" ? dados.categoria : `Coleção ${dados.categoria}`),
+    opcao && (v.rotulo === "Tubo" ? `tubo ${opcao}` : opcao),
+    dados.cor && `cor ${/^\d/.test(dados.cor) ? dados.cor : dados.cor.toLowerCase()}`,
+    m && m.tabela && m.tabela.corBlackout && dados.corBlackout && `blackout ${dados.corBlackout.toLowerCase()}`,
+    m && m.tabela && m.tabela.franzimentos && (c || !m.tabela.colecoes.length) && textoFranzimento(m, dados),
+  ].filter(Boolean).join(" - ");
 }
 
 function opcoesModelo() {
@@ -139,7 +246,14 @@ function calcularItem(dados) {
   const qtd = Math.max(1, parseInt(dados.qtd, 10) || 1);
   if (!m) return { total: 0, calc: "", medida: "" };
   const manual = lerNumero(dados.unitario);
-  const preco = manual || m.preco;
+  // Preço guardado quando o item foi feito; sem ele (item novo ou orçamento antigo), o da tabela de hoje.
+  // Adicionais em % (kit premium, base cunha) entram no m²; os de valor fixo, por peça.
+  const tabelado = lerNumero(dados.precoBase) || precoTabela(m, dados);
+  const adicionais = m.fixo ? [] : adicionaisDe(m, dados);
+  const pct = adicionais.reduce((t, a) => t + (a.pct || 0), 0);
+  const fixosPeca = adicionais.reduce((t, a) => t + (a.valor || 0), 0);
+  const preco = manual || tabelado * (1 + pct / 100);
+  const colecao = colecaoDe(m, dados.categoria);
 
   if (m.fixo) {
     return { total: preco * qtd, calc: preco ? `${qtd} x ${reais.format(preco)}` : "Informe o valor unitário.", medida: "", preco, qtd };
@@ -148,11 +262,30 @@ function calcularItem(dados) {
   const largura = lerMedida(dados.largura);
   const altura = lerMedida(dados.altura);
   if (!largura || !altura) return { total: 0, calc: "Informe largura e altura.", medida: "", preco, qtd };
+  if (!preco) return { total: 0, calc: m.tabela ? "Escolha a coleção." : "Informe o valor unitário.", medida: "", preco, qtd };
 
   let real = largura * altura;
   let un = "m²";
   let extra = "";
-  if (m.calculo === "tecido") {
+  let avisoTecido = "";
+  if (m.calculo === "tecido" && (colecao || (m.tabela && m.tabela.franzimentos && !m.tabela.colecoes.length))) {
+    // Largura x franzimento (linhos e tecido com blackout: o escolhido, padrão 3,00; acortinado: 2,50).
+    // Até 2,65 m de altura vai invertido; acima disso, em pé com emendas
+    un = "m";
+    const franzido = franzimentoUsado(m, dados);
+    const limite = m.tabela.alturaInvertido || m.alturamax;
+    const larguraTecido = largura * franzido;
+    const conta = `${numero.format(largura)} x ${numero.format(franzido)} = ${numero.format(larguraTecido)} m`;
+    if (altura <= limite + 1e-9) {
+      real = larguraTecido;
+      extra = `${conta}, tecido invertido`;
+    } else {
+      const panos = Math.ceil(larguraTecido / m.alturamax - 1e-9);
+      real = panos * altura;
+      extra = `${conta} de largura, tecido em pé com emendas, ${panos} pano(s) x ${numero.format(altura)} m`;
+      avisoTecido = `altura acima de ${numero.format(limite)} m: não dá para inverter o tecido, confirme com o cliente`;
+    }
+  } else if (m.calculo === "tecido") {
     un = "m";
     const larguraTecido = largura * TECIDO_FRANZIDO;
     if (altura <= m.alturamax) {
@@ -164,18 +297,34 @@ function calcularItem(dados) {
       extra = `tecido invertido, ${panos} pano(s) x ${numero.format(altura)} m`;
     }
   }
-  const minimo = real < AREA_MINIMA;
-  const cobrada = minimo ? AREA_MINIMA : real;
+  // Área mínima: a da tabela de tecidos quando tem coleção (ex.: 1,60 m² na rolô), senão 1,5
+  const areaMinima = (colecao && m.tabela.areaMinima) || AREA_MINIMA;
+  const minimo = real < areaMinima;
+  const cobrada = minimo ? areaMinima : real;
   // Guia opcional (rolô): (altura x 2 + largura) x valor do metro da guia, por peça
   const valorGuia = m.guia && dados.guia ? (altura * 2 + largura) * m.guia : 0;
-  const total = cobrada * preco * qtd + (m.acessorios || 0) * qtd + valorGuia * qtd;
+  const total = cobrada * preco * qtd + (m.acessorios || 0) * qtd + valorGuia * qtd + fixosPeca * qtd;
 
   const partes = [`${numero.format(cobrada)} ${un} x ${reais.format(preco)}`];
+  if (pct && !manual) partes.push(`(${reais.format(tabelado)} + ${adicionais.filter((a) => a.pct).map((a) => `${a.pct}% ${a.pdf.toLowerCase()}`).join(" + ")})`);
+  adicionais.filter((a) => a.valor).forEach((a) => partes.push(`+ ${a.pdf.toLowerCase()} ${reais.format(a.valor)}`));
   if (m.acessorios) partes.push(`+ ${m.acessoriosNome || "acessórios"} ${reais.format(m.acessorios)}`);
   if (valorGuia) partes.push(`+ guia ${reais.format(valorGuia)}`);
   if (qtd > 1) partes.push(`x ${qtd} peças`);
   if (extra) partes.push(`(${extra})`);
   if (minimo) partes.push(`- área mínima (real ${numero.format(real)} ${un})`);
+  if (avisoTecido && !colecao) partes.push(`· ATENÇÃO: ${avisoTecido}`);
+  if (colecao) {
+    const v = m.tabela.variante;
+    if (v && v.automatica && !dados.variante) partes.push(`· tubo ${v.opcoes[varianteUsada(m, dados)]} automático`);
+    // Avisos da tabela: largura máxima da coleção, área máxima do modelo e tubo R32 em peça grande
+    const avisos = [];
+    if (colecao.larguraMax && largura > colecao.larguraMax + 1e-9) avisos.push(`largura acima da máxima da coleção (${numero.format(colecao.larguraMax)} m)`);
+    if (m.tabela.areaMaxima && real > m.tabela.areaMaxima + 1e-9) avisos.push(`área acima da máxima do modelo (${numero.format(m.tabela.areaMaxima)} m²)`);
+    if (v && v.automatica && dados.variante === v.opcoes[0] && (real > 3.2 || largura > 2)) avisos.push("acima de 3,20 m² ou 2,00 m de largura use R38");
+    if (avisoTecido) avisos.push(avisoTecido);
+    if (avisos.length) partes.push(`· ATENÇÃO: ${avisos.join("; ")}`);
+  }
 
   return {
     total,
@@ -195,19 +344,102 @@ function adicionarItem(dados = {}) {
     if (campo && campo.type === "checkbox") campo.checked = !!v;
     else if (campo && "value" in campo && campo.tagName !== "OUTPUT") campo.value = v;
   });
-  // A opção de guia só aparece nos modelos que têm guia
+  // Coleção, opção (tubo/vias), cor e adicionais conforme o modelo (tabela de tecidos)
+  const selCat = el.querySelector('[data-campo="categoria"]');
+  const selVar = el.querySelector('[data-campo="variante"]');
+  const selCor = el.querySelector('[data-campo="cor"]');
+  const selFranz = el.querySelector('[data-campo="franzimento"]');
+  const selBk = el.querySelector('[data-campo="corBlackout"]');
+  const campoAdic = el.querySelector('[data-campo="adicionais"]');
+  const caixaAdic = el.querySelector(".item__adicionais");
+  const opcao = (valor, texto) => { const o = document.createElement("option"); o.value = valor; o.textContent = texto; return o; };
+  const preencherCores = (manter) => {
+    const c = colecaoDe(MODELOS[sel.value], selCat.value);
+    const cores = c ? c.cores : [];
+    selCor.replaceChildren(opcao("", cores.length ? "Escolha" : "-"), ...cores.map((cor) => opcao(cor, cor)));
+    // Cor guardada que saiu da tabela: continua aparecendo para não sumir do orçamento
+    if (manter && !cores.includes(manter)) selCor.appendChild(opcao(manter, manter));
+    selCor.value = manter || "";
+    selCor.closest("label").hidden = !cores.length && !manter;
+  };
+  const preencherTecido = (manterCat, manterCor, manterVar, manterAdic, manterFranz, manterBk) => {
+    const m = MODELOS[sel.value];
+    const t = m && m.tabela;
+    const cats = t ? t.colecoes : [];
+    selCat.replaceChildren(opcao("", cats.length ? "Escolha" : "-"), ...cats.map((c) => opcao(c.nome, c.nome)));
+    if (manterCat && !colecaoDe(m, manterCat)) selCat.appendChild(opcao(manterCat, manterCat));
+    selCat.value = manterCat || "";
+    selCat.closest("label").hidden = !cats.length && !manterCat;
+    el.querySelector(".item__categoria-rotulo").textContent = (t && t.rotulo) || "Coleção";
+    // Opção: tubo na rolô (com "Automático") ou número de vias no painel
+    const v = t && t.variante;
+    el.querySelector(".item__variante-rotulo").textContent = v ? v.rotulo : "Opção";
+    selVar.replaceChildren(...(v ? [...(v.automatica ? [opcao("", "Automático")] : []), ...v.opcoes.map((o) => opcao(o, o))] : []));
+    selVar.value = v ? (v.opcoes.includes(manterVar) ? manterVar : v.automatica ? "" : v.opcoes[0]) : "";
+    selVar.closest("label").hidden = !v;
+    // Franzimento (cortina de tecido): 2,00 a 4,00; sem escolha fica o padrão da linha (3,00)
+    const franz = (t && t.franzimentos) || [];
+    selFranz.replaceChildren(...franz.map((f) => opcao(numero.format(f), numero.format(f))));
+    selFranz.value = franz.length ? numero.format(franzimentoUsado(m, { franzimento: manterFranz })) : "";
+    selFranz.closest("label").hidden = !franz.length;
+    // Cor do blackout (linho com blackout): separada da cor do linho
+    const coresBk = (t && t.corBlackout) || [];
+    selBk.replaceChildren(...(coresBk.length ? [opcao("", "Escolha"), ...coresBk.map((c) => opcao(c, c))] : []));
+    if (manterBk && !coresBk.includes(manterBk)) selBk.appendChild(opcao(manterBk, manterBk));
+    selBk.value = coresBk.length || manterBk ? manterBk || "" : "";
+    selBk.closest("label").hidden = !coresBk.length;
+    // Adicionais: uma caixinha para cada um (guardados juntos, separados por vírgula)
+    const marcados = String(manterAdic || "").split(",");
+    const adic = (t && t.adicionais) || [];
+    caixaAdic.replaceChildren(...adic.map((a) => {
+      const l = document.createElement("label");
+      l.className = "item__adicional";
+      const c = document.createElement("input");
+      c.type = "checkbox";
+      c.value = a.id;
+      c.checked = marcados.includes(a.id);
+      l.append(c, ` ${a.nome}${a.pct ? ` (+${a.pct}%)` : a.valor ? ` (+ ${reais.format(a.valor)})` : ""}`);
+      return l;
+    }));
+    caixaAdic.hidden = !adic.length;
+    campoAdic.value = adic.filter((a) => marcados.includes(a.id)).map((a) => a.id).join(",");
+    preencherCores(manterCor);
+  };
+  preencherTecido(dados.categoria, dados.cor, dados.variante, dados.adicionais, dados.franzimento, dados.corBlackout);
+  sel.addEventListener("change", () => preencherTecido());
+  selCat.addEventListener("change", () => preencherCores());
+  caixaAdic.addEventListener("change", () => {
+    campoAdic.value = [...caixaAdic.querySelectorAll("input:checked")].map((c) => c.value).join(",");
+  });
+  // Campos conforme o modelo: guia só na rolô; item de valor fixo (avulso) não tem medidas
   const caixaGuia = el.querySelector(".item__guia");
-  const mostrarGuia = () => {
+  const medidas = el.querySelectorAll(".item__medida");
+  const rotuloDesc = el.querySelector(".item__desc-rotulo");
+  const ajustarCampos = () => {
     const m = MODELOS[sel.value];
     caixaGuia.hidden = !(m && m.guia);
     if (caixaGuia.hidden) caixaGuia.querySelector("input").checked = false;
+    const avulso = !!(m && m.fixo);
+    medidas.forEach((l) => { l.hidden = avulso; });
+    rotuloDesc.textContent = avulso ? "Nome / descrição do item (aparece no PDF)" : "Descrição (tecido, cor, comando, instalação...)";
+    el.classList.toggle("item--avulso", avulso);
+    ajustarPainelTecido();
   };
-  sel.addEventListener("change", mostrarGuia);
-  mostrarGuia();
-  ["largura", "altura", "unitario"].forEach((k) => {
+  // Quadro "Tecido e acabamento": some quando o modelo não tem nada para escolher ali
+  const painelTecido = el.querySelector(".item__tecido");
+  const ajustarPainelTecido = () => {
+    painelTecido.hidden = [".item__categoria", ".item__variante", ".item__franzimento", ".item__cor", ".item__cor-blackout", ".item__adicionais", ".item__guia"]
+      .every((s) => el.querySelector(s).hidden);
+  };
+  selCat.addEventListener("change", ajustarPainelTecido);
+  sel.addEventListener("change", ajustarCampos);
+  ajustarCampos();
+  ["largura", "altura"].forEach((k) => {
     const c = el.querySelector(`[data-campo="${k}"]`);
     c.addEventListener("input", () => soNumerosDecimal(c));
   });
+  const unitario = el.querySelector('[data-campo="unitario"]');
+  unitario.addEventListener("input", () => soValorEmReais(unitario));
   const q = el.querySelector('[data-campo="qtd"]');
   q.addEventListener("input", () => soInteiros(q));
   el.querySelector(".item__remover").addEventListener("click", () => { el.remove(); atualizar(); });
@@ -215,33 +447,43 @@ function adicionarItem(dados = {}) {
   atualizar();
 }
 
-function lerItens() {
-  return [...listaItens.querySelectorAll(".item")].map((el) => {
-    const d = {};
-    el.querySelectorAll("[data-campo]").forEach((c) => {
-      if (c.type === "checkbox") d[c.dataset.campo] = c.checked ? "1" : "";
-      else if (c.tagName !== "OUTPUT" && c.tagName !== "P") d[c.dataset.campo] = c.value;
-    });
-    return d;
+function lerItem(el) {
+  const d = {};
+  el.querySelectorAll("[data-campo]").forEach((c) => {
+    if (c.type === "checkbox") d[c.dataset.campo] = c.checked ? "1" : "";
+    else if (c.tagName !== "OUTPUT" && c.tagName !== "P") d[c.dataset.campo] = c.value;
   });
+  return d;
+}
+function lerItens() {
+  return [...listaItens.querySelectorAll(".item")].map(lerItem);
 }
 
+// Totais do que está na tela
 function totais() {
+  return calcularTotais({
+    descontoPct: form.descontoPct.value, frete: form.frete.value,
+    desconto: form.desconto.value, descontoTipo: form.descontoTipo.value,
+  }, lerItens());
+}
+
+// Totais a partir dos campos e itens (da tela ou de um rascunho guardado)
+function calcularTotais(campos, listaDeItens) {
   // Ajuste interno: "+10" aumenta e "-10" (ou só "10") diminui o preço de cada item.
   // Não vira linha no PDF: o cliente só vê os itens e o subtotal já ajustados.
-  const ajuste = String(form.descontoPct.value).trim();
+  const ajuste = String(campos.descontoPct || "").trim();
   const pctAjuste = lerNumero(ajuste.replace(/^[+-]/, ""));
   const fator = 1 + (ajuste.startsWith("+") ? 1 : -1) * pctAjuste / 100;
-  const itens = lerItens().map((d) => {
+  const itens = listaDeItens.map((d) => {
     const r = calcularItem(d);
     return { dados: d, r, totalAjustado: Math.max(0, r.total * fator) };
   });
   const subtotalSemAjuste = itens.reduce((t, i) => t + i.r.total, 0);
   const subtotal = itens.reduce((t, i) => t + i.totalAjustado, 0);
-  const frete = lerNumero(form.frete.value);
+  const frete = lerNumero(campos.frete);
   // Desconto que aparece no PDF: em % (sobre o subtotal) ou em R$
-  const valorDesconto = lerNumero(form.desconto.value);
-  const descontoEmPct = form.descontoTipo.value === "%";
+  const valorDesconto = lerNumero(campos.desconto);
+  const descontoEmPct = (campos.descontoTipo || "R$") === "%";
   const desconto = Math.min(subtotal, descontoEmPct ? subtotal * valorDesconto / 100 : valorDesconto);
   return {
     itens, subtotal, frete, desconto,
@@ -251,17 +493,51 @@ function totais() {
   };
 }
 
+// Texto do preço como fica guardado no item ("173,91"): lerNumero lê a vírgula como decimal
+const precoParaTexto = (v) => String(Math.round(v * 100) / 100).replace(".", ",");
 function atualizar() {
+  // Item com modelo e ainda sem preço guardado: guarda o da tabela de hoje
+  listaItens.querySelectorAll(".item").forEach((el) => {
+    const m = MODELOS[el.querySelector('[data-campo="modelo"]').value];
+    const base = el.querySelector('[data-campo="precoBase"]');
+    const chave = el.querySelector('[data-campo="precoChave"]');
+    const d = lerItem(el);
+    const atual = chavePreco(m, d);
+    // Orçamento antigo (sem chave): mantém o preço guardado e só anota a chave
+    if (m && !m.fixo && base.value && !chave.value) chave.value = atual;
+    // Item novo, ou mudou modelo/coleção/opção: guarda o preço da tabela de hoje
+    if (m && !m.fixo && (!base.value || chave.value !== atual)) { base.value = precoParaTexto(precoTabela(m, d)); chave.value = atual; }
+    if (!m || m.fixo) { base.value = ""; chave.value = ""; }
+  });
   const t = totais();
   [...listaItens.querySelectorAll(".item")].forEach((el, i) => {
     const { r, totalAjustado } = t.itens[i];
     // Valor do item = o que vai para o PDF (já com o ajuste interno)
     el.querySelector('[data-campo="total"]').textContent = reais.format(totalAjustado);
-    el.querySelector('[data-campo="calc"]').textContent = r.calc +
-      (t.ajusteInterno && r.total ? ` · sem ajuste: ${reais.format(r.total)}` : "");
+    // Topo do item: número e "Ambiente · Modelo" para achar o item fácil na lista
+    el.querySelector(".item__num").textContent = i + 1;
+    const mod = MODELOS[t.itens[i].dados.modelo];
+    el.querySelector(".item__titulo").textContent =
+      [String(t.itens[i].dados.ambiente || "").trim(), mod && mod.nome].filter(Boolean).join(" · ") || "Novo item";
     const m = MODELOS[t.itens[i].dados.modelo];
-    el.querySelector('[data-campo="unitario"]').placeholder = m && !m.fixo ? `${reais.format(m.preco)} (auto)` : "valor";
+    const base = lerNumero(t.itens[i].dados.precoBase);
+    const tabela = m && !m.fixo ? precoTabela(m, t.itens[i].dados) : 0;
+    const antigo = m && !m.fixo && base && Math.abs(base - tabela) > 0.005 && !lerNumero(t.itens[i].dados.unitario);
+    el.querySelector('[data-campo="calc"]').textContent = r.calc +
+      (t.ajusteInterno && r.total ? ` · sem ajuste: ${reais.format(r.total)}` : "") +
+      (antigo ? ` · preço de quando foi feito (tabela de hoje: ${reais.format(tabela)})` : "");
+    el.querySelector('[data-campo="unitario"]').placeholder = m && !m.fixo ? `${reais.format(base || tabela)} (auto)` : "valor";
   });
+  // Algum item com preço diferente da tabela de hoje: avisa e oferece atualizar
+  const diferentes = t.itens.filter((i) => {
+    const m = MODELOS[i.dados.modelo];
+    const base = lerNumero(i.dados.precoBase);
+    return m && !m.fixo && base && Math.abs(base - precoTabela(m, i.dados)) > 0.005 && !lerNumero(i.dados.unitario);
+  }).length;
+  document.querySelector("#aviso-precos").hidden = !diferentes;
+  document.querySelector("#aviso-precos-texto").textContent = diferentes
+    ? `${diferentes === 1 ? "1 item está" : `${diferentes} itens estão`} com o preço de quando o orçamento foi feito, diferente da tabela de hoje.`
+    : "";
   document.querySelector("#r-subtotal").textContent = reais.format(t.subtotal);
   document.querySelector("#r-frete").textContent = reais.format(t.frete);
   document.querySelector("#r-desconto-rotulo").textContent = t.descontoPct ? `Desconto (${numero.format(t.descontoPct).replace(",00", "")}%)` : "Desconto";
@@ -272,11 +548,30 @@ function atualizar() {
     : "O ajuste interno entra no preço de cada item e não aparece no PDF.";
   document.querySelector("#r-total").textContent = reais.format(t.total);
   atualizarDatas(t);
+  atualizarRecibo(t);
+  // Forma de pagamento: texto calculado pelo total, até você editar à mão
+  if (form.pagamentoAuto.value === "1") form.pagamento.value = textoPagamentoPadrao(t.total);
+  // Texto editado à mão com valores em R$ que não batem com o total de agora: avisa
   const p = condicoesPagamento(t.total);
-  document.querySelector("#r-pagamento").textContent = t.total
-    ? `À vista: ${reais.format(p.avista)} (${PAGAMENTO.descontoAvista}% de desconto) · Cartão: ${PAGAMENTO.parcelas}x de ${reais.format(p.parcela)} sem juros`
-    : "";
+  const valoresTexto = form.pagamento.value.match(/R\$\s?[\d.]+,\d{2}/g) || [];
+  const atuais = [t.total, p.avista, p.parcela].map((v) => reais.format(v).replace(/\s/g, " "));
+  const desatualizado = form.pagamentoAuto.value !== "1" && t.total && valoresTexto.length &&
+    !valoresTexto.some((v) => atuais.includes(v.replace(/R\$\s?/, "R$ ").replace(/\s/g, " ")));
+  const dicaPag = document.querySelector("#dica-pagamento");
+  dicaPag.classList.toggle("dica--alerta", !!desatualizado);
+  dicaPag.textContent = form.pagamentoAuto.value === "1"
+    ? "Preenchido sozinho pelo total. Pode editar à vontade."
+    : desatualizado
+      ? `Atenção: o total mudou (${reais.format(t.total)}) e os valores deste texto não batem mais. Confira, ou apague tudo para recalcular.`
+      : "Texto editado por você (não muda mais sozinho). Apague tudo para voltar ao cálculo automático.";
   salvarRascunho();
+}
+
+function textoPagamentoPadrao(total) {
+  if (!total) return "";
+  const p = condicoesPagamento(total);
+  return `À vista: ${reais.format(p.avista)} (${PAGAMENTO.descontoAvista}% de desconto)\n` +
+    `Cartão: ${PAGAMENTO.parcelas}x de ${reais.format(p.parcela)} sem juros`;
 }
 
 // Validade (só orçamento) e previsão de entrega calculada pelos prazos dos itens
@@ -295,27 +590,57 @@ function atualizarDatas(t) {
 }
 
 /* ---------- Rascunho (só neste aparelho) ---------- */
+// Tudo o que está na tela: { campos, itens } (serve para o rascunho e para salvar no servidor)
+function dadosAtuais() {
+  const campos = {};
+  [...form.elements].forEach((c) => {
+    if (c.name && c.type !== "file") campos[c.name] = c.type === "checkbox" ? c.checked : c.value;
+  });
+  // Guarda também o nome do modelo, para não trocar de modelo se a lista mudar
+  const itens = lerItens().map((d) => ({ ...d, nome: MODELOS[d.modelo] ? MODELOS[d.modelo].nome : "" }));
+  return { campos, itens };
+}
 function salvarRascunho() {
-  try {
-    const campos = {};
-    [...form.elements].forEach((c) => {
-      if (c.name && c.type !== "file") campos[c.name] = c.type === "checkbox" ? c.checked : c.value;
-    });
-    // Guarda também o nome do modelo, para o rascunho não trocar de modelo se a lista mudar
-    const itens = lerItens().map((d) => ({ ...d, nome: MODELOS[d.modelo] ? MODELOS[d.modelo].nome : "" }));
-    localStorage.setItem(chaveRascunho, JSON.stringify({ campos, itens }));
-  } catch (e) {}
+  try { localStorage.setItem(chaveRascunho, JSON.stringify(dadosAtuais())); } catch (e) {}
+}
+// Itens guardados -> itens com o modelo certo da lista atual (pelo nome)
+function itensComModelo(itens) {
+  return (itens || []).map(({ nome, ...d }) => {
+    // Acortinado BK era coleção da "Cortina de tecido com blackout"; agora é modelo próprio
+    if (nome === "Cortina de tecido com blackout" && d.categoria === "Acortinado BK") nome = "Cortina acortinado";
+    if (nome) { const i = MODELOS.findIndex((m) => m.nome === nome); d.modelo = i >= 0 ? String(i) : ""; }
+    return d;
+  });
+}
+// Coloca na tela um orçamento guardado ({ campos, itens })
+function aplicarDados(r) {
+  limparFormulario();
+  listaItens.innerHTML = "";
+  Object.entries(r.campos || {}).forEach(([k, v]) => {
+    const c = form[k];
+    if (!c || c.type === "file") return;
+    if (c.type === "checkbox") c.checked = v === true;
+    else c.value = v;
+  });
+  // Rascunho de antes do desconto em %: o desconto dele era em R$
+  if (!("descontoTipo" in (r.campos || {}))) form.descontoTipo.value = "R$";
+  const itens = itensComModelo(r.itens);
+  (itens.length ? itens : [{}]).forEach((d) => adicionarItem(d));
 }
 function carregarRascunho() {
   try { return JSON.parse(localStorage.getItem(chaveRascunho)); } catch (e) { return null; }
 }
-function proximoNumero() {
-  try { const n = parseInt(localStorage.getItem(CHAVE_ULTIMO), 10); return n ? String(n + 1) : ""; } catch (e) { return ""; }
+// Campo oculto não volta sozinho com o reset: sem isto o novo herdaria dados do anterior
+function limparFormulario() {
+  form.reset();
+  form.idServidor.value = "";
+  form.previsaoAuto.value = "1";
+  form.pagamentoAuto.value = "1";
 }
 function novoOrcamento() {
-  form.reset();
+  limparFormulario();
   listaItens.innerHTML = "";
-  form.numero.value = proximoNumero();
+  form.numero.value = "";
   form.data.value = hoje();
   form.validade.value = somarDias(form.data.value, VALIDADE_DIAS);
   form.consideracoes.value = CONSIDERACOES_PADRAO;
@@ -324,8 +649,15 @@ function novoOrcamento() {
 
 // Mudou a previsão na mão: para de calcular sozinho. Apagou: volta ao automático
 form.previsao.addEventListener("input", () => { form.previsaoAuto.value = form.previsao.value ? "" : "1"; });
-// Mudou a data do orçamento: a validade acompanha
-form.data.addEventListener("change", () => { if (form.data.value) form.validade.value = somarDias(form.data.value, VALIDADE_DIAS); });
+// Editou a forma de pagamento: fica como você escreveu. Apagou tudo: volta ao automático
+form.pagamento.addEventListener("input", () => { form.pagamentoAuto.value = form.pagamento.value.trim() ? "" : "1"; });
+// Mudou a data do orçamento: a validade acompanha (e o número, se o mês mudou)
+form.data.addEventListener("change", () => {
+  if (form.data.value) form.validade.value = somarDias(form.data.value, VALIDADE_DIAS);
+  sugerirNumero();
+});
+// Trocou entre orçamento e pedido: cada um tem a sua sequência
+form.tipo.addEventListener("change", () => sugerirNumero());
 
 /* ---------- Máscaras simples ---------- */
 form.telefone.addEventListener("input", () => {
@@ -340,7 +672,25 @@ form.cep.addEventListener("input", () => {
   const d = form.cep.value.replace(/\D/g, "").slice(0, 8);
   form.cep.value = d.length > 5 ? `${d.slice(0, 5)}-${d.slice(5)}` : d;
 });
-["frete", "desconto"].forEach((n) => form[n].addEventListener("input", () => soNumerosDecimal(form[n])));
+form.frete.addEventListener("input", () => soValorEmReais(form.frete));
+// Desconto: em R$ o ponto é milhar ("1.200"); em % o ponto é decimal ("5.5" = 5,5%) e vai até 100
+form.desconto.addEventListener("input", () => {
+  if (form.descontoTipo.value !== "%") return soValorEmReais(form.desconto);
+  soNumerosDecimal(form.desconto);
+  if (lerNumero(form.desconto.value) > 100) form.desconto.value = "100";
+});
+// Trocou R$ <-> %: converte para o mesmo desconto (R$ 50 num subtotal de R$ 1.000 vira 5%)
+let tipoDescontoAnterior = form.descontoTipo.value;
+form.descontoTipo.addEventListener("focus", () => { tipoDescontoAnterior = form.descontoTipo.value; });
+form.descontoTipo.addEventListener("change", () => {
+  const valor = lerNumero(form.desconto.value);
+  const sub = totais().subtotal;
+  if (valor && sub && tipoDescontoAnterior !== form.descontoTipo.value) {
+    const novo = form.descontoTipo.value === "%" ? Math.min(100, valor / sub * 100) : sub * valor / 100;
+    form.desconto.value = numero.format(novo).replace(/\./g, "").replace(/,00$/, "");
+  }
+  tipoDescontoAnterior = form.descontoTipo.value;
+});
 // Ajuste (%): aceita um sinal + ou - no começo e depois só números
 form.descontoPct.addEventListener("input", () => {
   const c = form.descontoPct;
@@ -350,20 +700,62 @@ form.descontoPct.addEventListener("input", () => {
   const v = sinal + resto.value;
   if (v !== c.value) c.value = v;
 });
+// Sem sinal conta como desconto: ao sair do campo, mostra o "-" para não haver dúvida
+form.descontoPct.addEventListener("blur", () => {
+  const c = form.descontoPct;
+  if (/^\d/.test(c.value.trim()) && lerNumero(c.value)) { c.value = "-" + c.value.trim(); atualizar(); }
+});
 
 form.addEventListener("input", atualizar);
 form.addEventListener("change", atualizar);
 document.querySelector("#add-item").addEventListener("click", () => adicionarItem());
-document.querySelector("#novo").addEventListener("click", () => {
-  if (!confirm("Começar um orçamento novo? O atual sai da tela.")) return;
-  // Se veio de um link, o pedido dele continua guardado; o novo usa o rascunho geral
+// Passa todos os itens para o preço da tabela de hoje
+document.querySelector("#usar-precos-atuais").addEventListener("click", () => {
+  if (!confirm("Atualizar os itens para os preços da tabela de hoje? O valor do orçamento vai mudar.")) return;
+  listaItens.querySelectorAll('[data-campo="precoBase"]').forEach((c) => { c.value = ""; });
+  atualizar();
+});
+// Item avulso: já vem como "Serviço / outro item" (valor fixo), com o cursor no nome
+document.querySelector("#add-avulso").addEventListener("click", () => {
+  const i = MODELOS.findIndex((m) => m.nome === "Serviço / outro item");
+  adicionarItem({ modelo: i >= 0 ? String(i) : "" });
+  const novo = listaItens.lastElementChild;
+  novo.querySelector('[data-campo="descricao"]').focus();
+});
+// Guarda o que está na tela (se tiver algo). A tela é liberada na hora; o envio ao servidor segue por trás
+function fecharAtual() {
+  const t = totais();
+  const temAlgo = !!form.cliente.value.trim() || t.total > 0;
+  let envio = Promise.resolve();
+  if (temAlgo) {
+    const dados = dadosAtuais();
+    envio = api("POST", "/orcamentos", { id: form.idServidor.value, dados, resumo: resumoPara(dados, t.total) }).catch(() => null);
+  }
+  // Se veio de um link ou da lista, aquele continua guardado; o novo usa o rascunho geral
   if (chaveRascunho !== CHAVE_RASCUNHO) {
     chaveRascunho = CHAVE_RASCUNHO;
     history.replaceState(null, "", location.pathname);
-    erro.hidden = true;
   }
+  erro.hidden = true;
+  return { envio };
+}
+// Número do novo: o próximo do mês e do tipo, pedido ao servidor depois que o anterior foi salvo
+// (tela vazia não é salva, então não gasta número)
+async function numerarNovo({ envio }) {
+  form.numero.value = "";
+  atualizar();
+  salvarRascunho();
+  await envio;
+  await sugerirNumero();
+}
+// "Novo orçamento": no topo da página e no fim do formulário
+["#novo", "#novo-topo"].forEach((s) => document.querySelector(s).addEventListener("click", () => {
+  if (!confirm("Começar um orçamento novo? O atual é salvo e sai da tela.")) return;
+  const fechado = fecharAtual();
   novoOrcamento();
-});
+  window.scrollTo({ top: 0 });
+  numerarNovo(fechado);
+}));
 
 /* ---------- PDF ---------- */
 // O PDF usa a fonte padrão (Latin-1): troca caracteres que ela não tem
@@ -390,19 +782,17 @@ function imagemParaDataURL(src, max = 1400, tipo = "image/jpeg") {
 }
 const arquivoParaURL = (f) => new Promise((ok) => { const r = new FileReader(); r.onload = () => ok(r.result); r.readAsDataURL(f); });
 
-async function gerarPDF() {
-  const { jsPDF } = window.jspdf;
-  const doc = new jsPDF({ unit: "mm", format: "a4" });
-  const W = 210, M = 14, AZUL = [5, 105, 176], LARANJA = [138, 150, 163], CINZA = [90, 96, 94];
-  const t = totais();
+/* ---------- Partes comuns dos PDFs (orçamento, pedido e recibo) ---------- */
+// Cores da Eclipse Cortinas: azul da logo (textos/linhas) e cinza-azulado (destaques)
+const PDF_W = 210, PDF_M = 14, PDF_AZUL = [5, 105, 176], PDF_LARANJA = [138, 150, 163], PDF_CINZA = [90, 96, 94];
+// Título, logo, dados da loja (esquerda) e do cliente (direita). Devolve onde começa a faixa
+async function cabecalhoPDF(doc, rotulo, vendedor) {
+  const W = PDF_W, M = PDF_M, AZUL = PDF_AZUL;
   const f = form;
-  const tipo = f.tipo.value || "Orçamento"; // "Orçamento" ou "Pedido"
-  const ocultarMedidas = f.ocultarMedidas.checked;
-
   // Cabeçalho
   doc.setFont("helvetica", "bold"); doc.setFontSize(9); doc.setTextColor(...AZUL);
-  doc.text(tipo.toUpperCase(), M, 13);
-  doc.setDrawColor(...AZUL); doc.setLineWidth(0.4); doc.line(M + doc.getTextWidth(tipo.toUpperCase()) + 4, 12, W - M, 12);
+  doc.text(txt(rotulo.toUpperCase()), M, 13);
+  doc.setDrawColor(...AZUL); doc.setLineWidth(0.4); doc.line(M + doc.getTextWidth(txt(rotulo.toUpperCase())) + 4, 12, W - M, 12);
 
   try {
     const logo = await imagemParaDataURL(EMPRESA.logo, 480, "image/png");
@@ -411,16 +801,16 @@ async function gerarPDF() {
     doc.setFontSize(18); doc.text(EMPRESA.nome, M, 30);
   }
 
-  // Dados da empresa (esquerda) e do cliente (direita) começam na mesma linha
+  // Dados da loja (esquerda) e do cliente (direita) começam na mesma linha
   const Y_NOME = 46, Y_LINHAS = 50.5, ENTRELINHA = 4.2;
   doc.setTextColor(30, 37, 35); doc.setFont("helvetica", "bold"); doc.setFontSize(9.5);
   doc.text(EMPRESA.nome, M, Y_NOME);
   doc.setFont("helvetica", "normal"); doc.setFontSize(8.5);
   let y = Y_LINHAS;
   EMPRESA.linhas.forEach((l) => { doc.text(txt(l), M, y); y += ENTRELINHA; });
-  if (f.vendedor.value) { doc.text(txt(`Vendedor: ${f.vendedor.value}`), M, y); y += ENTRELINHA; }
+  if (vendedor) { doc.text(txt(`Vendedor: ${vendedor}`), M, y); y += ENTRELINHA; }
 
-  // Cliente: encostado no canto direito, nas mesmas linhas dos dados da empresa
+  // Cliente: encostado no canto direito, nas mesmas linhas dos dados da loja
   const XD = W - M, LARG_C = 85;
   doc.setFont("helvetica", "bold"); doc.setFontSize(8); doc.setTextColor(...AZUL);
   doc.text("CLIENTE", XD, Y_NOME - 5, { align: "right" });
@@ -435,23 +825,18 @@ async function gerarPDF() {
       doc.splitTextToSize(txt(l), LARG_C).forEach((parte) => { doc.text(parte, XD, yc, { align: "right" }); yc += ENTRELINHA; });
     });
 
-  // Faixa de informações
-  const yi = Math.max(y, yc) + 6;
+  return Math.max(y, yc) + 6;
+}
+// Faixa de informações entre duas linhas azuis; a última coluna fica em destaque
+function faixaPDF(doc, yi, info) {
+  const W = PDF_W, M = PDF_M, AZUL = PDF_AZUL, CINZA = PDF_CINZA;
   doc.setDrawColor(...AZUL); doc.setLineWidth(0.6); doc.line(M, yi, W - M, yi);
-  const info = [
-    [`Nº do ${tipo}`, f.numero.value || "-"],
-    ["Data", dataBR(f.data.value)],
-    // Pedido fechado não tem validade
-    ...(tipo === "Pedido" ? [] : [["Válido até", dataBR(f.validade.value) || "-"]]),
-    ["Previsão de Entrega", dataBR(f.previsao.value) || "A combinar"],
-    ["Valor Total", numero.format(t.total)],
-  ];
   const colW = (W - 2 * M) / info.length;
   const ultima = info.length - 1;
   info.forEach(([rotulo, valor], i) => {
     const x = M + colW * i;
     const destaque = i === ultima;
-    if (destaque) { doc.setFillColor(228, 232, 243); doc.rect(x, yi + 1.5, colW, 17, "F"); }
+    if (destaque) { doc.setFillColor(227, 238, 248); doc.rect(x, yi + 1.5, colW, 17, "F"); }
     doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(...CINZA);
     doc.text(txt(rotulo), x + colW / 2, yi + 7, { align: "center" });
     doc.setFont("helvetica", "bold"); doc.setFontSize(destaque ? 13 : 11.5);
@@ -459,11 +844,47 @@ async function gerarPDF() {
     doc.text(txt(valor), x + colW / 2, yi + 14.5, { align: "center" });
   });
   doc.setLineWidth(0.6); doc.line(M, yi + 20, W - M, yi + 20);
+}
+// Rodapé em todas as páginas
+function rodapePDF(doc, textoDireita) {
+  const W = PDF_W, M = PDF_M;
+  const paginas = doc.getNumberOfPages();
+  for (let p = 1; p <= paginas; p++) {
+    doc.setPage(p);
+    doc.setDrawColor(...PDF_LARANJA); doc.setLineWidth(0.8); doc.line(M, 287, W - M, 287);
+    doc.setFont("helvetica", "normal"); doc.setFontSize(7.5); doc.setTextColor(...PDF_CINZA);
+    doc.text(txt(`${EMPRESA.nome} - ${EMPRESA.site} - ${EMPRESA.telefone}`), M, 291.5);
+    doc.text(txt(`${textoDireita}${paginas > 1 ? ` - Pág. ${p}/${paginas}` : ""}`), W - M, 291.5, { align: "right" });
+  }
+}
+
+async function gerarPDF() {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: "mm", format: "a4" });
+  const W = PDF_W, M = PDF_M, AZUL = PDF_AZUL, LARANJA = PDF_LARANJA, CINZA = PDF_CINZA;
+  const t = totais();
+  const f = form;
+  const tipo = f.tipo.value || "Orçamento"; // "Orçamento" ou "Pedido"
+  const ocultarMedidas = f.ocultarMedidas.checked;
+
+  const yi = await cabecalhoPDF(doc, tipo, f.vendedor.value);
+  faixaPDF(doc, yi, [
+    [`Nº do ${tipo}`, f.numero.value || "-"],
+    ["Data", dataBR(f.data.value)],
+    // Pedido fechado não tem validade
+    ...(tipo === "Pedido" ? [] : [["Válido até", dataBR(f.validade.value) || "-"]]),
+    ["Previsão de Entrega", dataBR(f.previsao.value) || "A combinar"],
+    ["Valor Total", numero.format(t.total)],
+  ]);
 
   // Tabela de itens
   const linhas = t.itens.filter((i) => MODELOS[i.dados.modelo]).map(({ dados, r, totalAjustado }) => {
     const m = MODELOS[dados.modelo];
-    const desc = [m.nome.toUpperCase(), m.guia && dados.guia && "Com guia", dados.descricao, !ocultarMedidas && r.medida].filter(Boolean).join("\n");
+    // Item de valor fixo com descrição: a própria descrição vira o título (sem "SERVIÇO / OUTRO ITEM")
+    const titulo = m.fixo && dados.descricao ? "" : m.nome.toUpperCase();
+    // Tecido logo abaixo do modelo ("Coleção Screen 3% - tubo R38 - cor 701") e os adicionais
+    const adicionais = adicionaisDe(m, dados).map((a) => a.pdf).join(", ");
+    const desc = [titulo, textoTecido(m, dados), adicionais, m.guia && dados.guia && "Com guia", dados.descricao, !ocultarMedidas && r.medida].filter(Boolean).join("\n");
     // Preço já com o ajuste interno embutido
     return [txt(dados.ambiente || "-"), txt(desc), String(r.qtd || 1), txt(reais.format(totalAjustado))];
   });
@@ -486,13 +907,18 @@ async function gerarPDF() {
   // Forma de pagamento e observações (à esquerda) e totais (à direita)
   let yt = doc.lastAutoTable.finalY + 8;
   if (yt > 240) { doc.addPage(); yt = 20; }
-  const pg = condicoesPagamento(t.total);
-  doc.setFont("helvetica", "bold"); doc.setFontSize(8.5); doc.setTextColor(30, 37, 35);
-  doc.text("FORMA DE PAGAMENTO:", M, yt);
-  doc.setFont("helvetica", "normal");
-  doc.text(txt(`À vista: ${reais.format(pg.avista)} (${PAGAMENTO.descontoAvista}% de desconto)`), M, yt + 5);
-  doc.text(txt(`Cartão: ${PAGAMENTO.parcelas}x de ${reais.format(pg.parcela)} sem juros`), M, yt + 9.5);
-  const yObs = yt + 17;
+  doc.setFontSize(8.5); doc.setTextColor(30, 37, 35);
+  // Texto do campo "Forma de pagamento" (automático ou editado); vazio = não aparece
+  const pagamento = f.pagamento.value.split("\n").map((s) => s.trim()).filter(Boolean)
+    .flatMap((linha) => doc.splitTextToSize(txt(linha), 105));
+  let yObs = yt;
+  if (pagamento.length) {
+    doc.setFont("helvetica", "bold");
+    doc.text("FORMA DE PAGAMENTO:", M, yt);
+    doc.setFont("helvetica", "normal");
+    pagamento.forEach((linha, i) => doc.text(linha, M, yt + 5 + i * 4.5));
+    yObs = yt + 5 + pagamento.length * 4.5 + 3;
+  }
   doc.setFont("helvetica", "bold");
   doc.text("OBS:", M, yObs);
   doc.setFont("helvetica", "normal");
@@ -553,13 +979,12 @@ async function gerarPDF() {
     doc.setPage(p);
     doc.setDrawColor(...LARANJA); doc.setLineWidth(0.8); doc.line(M, 287, W - M, 287);
     doc.setFont("helvetica", "normal"); doc.setFontSize(7.5); doc.setTextColor(...CINZA);
-    doc.text(txt(`${EMPRESA.nome} - ${EMPRESA.site} - (85) 9 8423-1563`), M, 291.5);
+    doc.text(txt(`${EMPRESA.nome} - ${EMPRESA.site} - ${EMPRESA.telefone}`), M, 291.5);
     doc.text(`${tipo} Nº ${txt(f.numero.value)} - Pág. ${p}/${paginas}`, W - M, 291.5, { align: "right" });
   }
 
   const nomeArquivo = `${tipo === "Pedido" ? "Pedido" : "Orcamento"} ${f.numero.value || ""} - ${f.cliente.value || "cliente"}`.replace(/[\\/:*?"<>|]/g, "").trim();
   doc.save(`${nomeArquivo}.pdf`);
-  try { localStorage.setItem(CHAVE_ULTIMO, String(parseInt(f.numero.value, 10) || "")); } catch (e) {}
 }
 
 form.addEventListener("submit", async (e) => {
@@ -577,7 +1002,212 @@ form.addEventListener("submit", async (e) => {
     return;
   }
   if (!window.jspdf) { erro.textContent = "Não foi possível carregar o gerador de PDF. Verifique a internet e tente de novo."; erro.hidden = false; return; }
+  // Gerar o PDF sempre salva no servidor (aparece em "Meus orçamentos"). Salva antes do PDF,
+  // porque o servidor pode trocar o número e o PDF precisa sair com o número que ficou salvo.
+  const salvo = await salvarNoServidor({ silencioso: true });
   await gerarPDF();
+  if (salvo) aviso(`PDF baixado e ${form.tipo.value.toLowerCase()} nº ${form.numero.value} salvo em "Meus orçamentos".`);
+  else aviso("PDF baixado, mas não foi possível salvar no servidor (sem conexão?). Clique em \"Salvar\" quando a internet voltar.", "");
+});
+
+/* ---------- Recibo ----------
+   Usa o cliente e o total do formulário. Campo vazio = automático
+   (valor pelo total, nº pelo do pedido, data de hoje, "referente a" pelos itens). */
+const PARTES_RECIBO = {
+  total: { fator: 1, texto: "" },
+  entrada: { fator: 0.5, texto: "entrada (sinal)" },
+  restante: { fator: 0.5, texto: "pagamento restante (quitação)" },
+};
+const MESES = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"];
+
+// 150 -> "cento e cinquenta reais"; 1250,5 -> "mil duzentos e cinquenta reais e cinquenta centavos"
+function valorPorExtenso(valor) {
+  const UN = ["", "um", "dois", "três", "quatro", "cinco", "seis", "sete", "oito", "nove", "dez", "onze", "doze", "treze",
+    "catorze", "quinze", "dezesseis", "dezessete", "dezoito", "dezenove"];
+  const DEZ = ["", "", "vinte", "trinta", "quarenta", "cinquenta", "sessenta", "setenta", "oitenta", "noventa"];
+  const CEM = ["", "cento", "duzentos", "trezentos", "quatrocentos", "quinhentos", "seiscentos", "setecentos", "oitocentos", "novecentos"];
+  const ate999 = (n) => {
+    if (n === 100) return "cem";
+    const partes = [];
+    if (n >= 100) partes.push(CEM[Math.floor(n / 100)]);
+    const r = n % 100;
+    if (r && r < 20) partes.push(UN[r]);
+    else if (r) partes.push(DEZ[Math.floor(r / 10)] + (r % 10 ? ` e ${UN[r % 10]}` : ""));
+    return partes.join(" e ");
+  };
+  const inteiro = (n) => {
+    if (!n) return "";
+    const mi = Math.floor(n / 1e6), mil = Math.floor((n % 1e6) / 1000), resto = n % 1000;
+    const partes = [];
+    if (mi) partes.push(`${ate999(mi)} ${mi === 1 ? "milhão" : "milhões"}`);
+    if (mil) partes.push(mil === 1 ? "mil" : `${ate999(mil)} mil`);
+    if (resto) partes.push(ate999(resto));
+    // "mil e quinhentos", mas "mil duzentos e cinquenta"
+    const ultimo = partes.length > 1 && resto && (resto < 100 || resto % 100 === 0) ? " e " : " ";
+    return partes.length > 1 ? partes.slice(0, -1).join(" ") + (resto ? ultimo : " ") + partes[partes.length - 1] : partes[0];
+  };
+  const centavosTotal = Math.round(valor * 100);
+  const r = Math.floor(centavosTotal / 100), c = centavosTotal % 100;
+  const partes = [];
+  if (r) partes.push(`${inteiro(r)}${r % 1e6 === 0 ? " de" : ""} ${r === 1 ? "real" : "reais"}`);
+  if (c) partes.push(`${ate999(c)} ${c === 1 ? "centavo" : "centavos"}`);
+  return partes.join(" e ") || "zero real";
+}
+
+// Nº do recibo sugerido a partir do pedido: PED 11/26-003 -> REC 11/26-003
+function numeroReciboAuto() {
+  const m = form.numero.value.trim().match(RE_NUMERO);
+  return m ? `REC ${m[2]}/${m[3]}-${m[4]}` : "";
+}
+// "Pedido nº PED 11/26-003 - entrada (sinal): Cortina rolô (2), Persiana vertical"
+function referenteAuto(t) {
+  const itens = t.itens.filter((i) => MODELOS[i.dados.modelo] && i.r.total > 0);
+  if (!itens.length) return "";
+  const nomes = itens.map(({ dados, r }) => {
+    const m = MODELOS[dados.modelo];
+    const nome = m.fixo && dados.descricao ? dados.descricao : m.nome;
+    return r.qtd > 1 ? `${nome} (${r.qtd})` : nome;
+  });
+  const lista = nomes.length > 4 ? `${nomes.slice(0, 4).join(", ")} e mais ${nomes.length - 4} itens` : nomes.join(", ");
+  const parte = PARTES_RECIBO[form.reciboParte.value].texto;
+  const doc = form.numero.value.trim() ? `${form.tipo.value} nº ${form.numero.value.trim()}` : form.tipo.value;
+  return `${doc}${parte ? ` - ${parte}` : ""}: ${lista}`;
+}
+function dadosRecibo(t = totais()) {
+  const parte = form.reciboParte.value;
+  const valorAuto = t.total * PARTES_RECIBO[parte].fator;
+  return {
+    parte,
+    valor: lerNumero(form.reciboValor.value) || valorAuto,
+    valorAuto,
+    numero: form.reciboNumero.value.trim() || numeroReciboAuto(),
+    data: form.reciboData.value || hoje(),
+    forma: form.reciboForma.value,
+    referente: form.reciboRef.value.trim() || referenteAuto(t),
+    total: t.total,
+  };
+}
+// Mostra nos campos vazios o que vai sair no recibo
+function atualizarRecibo(t) {
+  const r = dadosRecibo(t);
+  form.reciboValor.placeholder = r.valorAuto ? numero.format(r.valorAuto) : "0,00";
+  form.reciboNumero.placeholder = numeroReciboAuto() || "Opcional";
+  const ref = referenteAuto(t);
+  form.reciboRef.placeholder = ref || "Ex.: serviço de manutenção de cortinas";
+  document.querySelector("#dica-recibo").textContent = r.valor
+    ? `Vai sair: ${reais.format(r.valor)} (${valorPorExtenso(r.valor)}).` +
+      (r.parte === "entrada" && r.total > r.valor ? ` Fica faltando ${reais.format(r.total - r.valor)}.` : "") +
+      (ref && !form.reciboRef.value.trim() ? " O \"referente a\" sai com os itens do orçamento; escreva outro texto se quiser." : "")
+    : "Sem itens? Escreva o valor e o \"referente a\" (ex.: serviço de manutenção) e baixe o recibo.";
+}
+
+async function gerarRecibo() {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: "mm", format: "a4", compress: true });
+  const W = PDF_W, M = PDF_M, AZUL = PDF_AZUL, CINZA = PDF_CINZA;
+  const r = dadosRecibo();
+  const f = form;
+
+  const yi = await cabecalhoPDF(doc, "Recibo", "");
+  faixaPDF(doc, yi, [
+    ["Nº do Recibo", r.numero || "-"],
+    ["Data", dataBR(r.data)],
+    ["Forma de Pagamento", r.forma || "-"],
+    ["Valor Recebido", numero.format(r.valor)],
+  ]);
+
+  // Texto do recibo
+  const digitos = f.documento.value.replace(/\D/g, "");
+  const rotuloDoc = digitos.length === 14 ? "CNPJ" : digitos.length === 11 ? "CPF" : "CPF/CNPJ";
+  const endereco = [f.endereco.value, f.bairro.value, f.cidade.value].map((s) => s.trim()).filter(Boolean).join(", ");
+  const corpo = `Recebemos de ${f.cliente.value.trim()}` +
+    (f.documento.value.trim() ? `, inscrito(a) no ${rotuloDoc} ${f.documento.value.trim()}` : "") +
+    (endereco ? `, com endereço em ${endereco}` : "") +
+    `, a importância de ${reais.format(r.valor)} (${valorPorExtenso(r.valor)})` +
+    (r.forma ? `, paga via ${r.forma.toLowerCase().replace("pix", "Pix")}` : "") + ", referente ao descrito abaixo.";
+  let y = yi + 34;
+  doc.setFont("helvetica", "normal"); doc.setFontSize(11); doc.setTextColor(30, 37, 35);
+  const linhas = doc.splitTextToSize(txt(corpo), W - 2 * M);
+  doc.text(linhas, M, y, { lineHeightFactor: 1.5 });
+  y += linhas.length * 11 * 0.3528 * 1.5 + 8;
+
+  // Referente a: caixa clara com o texto
+  const ref = doc.splitTextToSize(txt(r.referente), W - 2 * M - 12);
+  const extra = r.parte === "entrada" && r.total > r.valor
+    ? [txt(`Valor total: ${reais.format(r.total)} - Recebido agora: ${reais.format(r.valor)} - Saldo a pagar: ${reais.format(r.total - r.valor)}`)]
+    : [];
+  const hCaixa = 12 + (ref.length + extra.length) * 5.2;
+  doc.setFillColor(242, 246, 250); doc.rect(M, y, W - 2 * M, hCaixa, "F");
+  doc.setFillColor(...AZUL); doc.rect(M, y, 1.2, hCaixa, "F");
+  doc.setFont("helvetica", "bold"); doc.setFontSize(8); doc.setTextColor(...AZUL);
+  doc.text("REFERENTE A", M + 6, y + 6.5);
+  doc.setFont("helvetica", "normal"); doc.setFontSize(10); doc.setTextColor(30, 37, 35);
+  doc.text(ref, M + 6, y + 12.5);
+  if (extra.length) { doc.setFontSize(9); doc.setTextColor(...CINZA); doc.text(extra, M + 6, y + 12.5 + ref.length * 5.2); }
+  y += hCaixa + 12;
+
+  // Quitação
+  doc.setFont("helvetica", "normal"); doc.setFontSize(11); doc.setTextColor(30, 37, 35);
+  const quitacao = r.parte === "entrada"
+    ? "Para clareza, firmamos o presente recibo do valor acima, recebido como entrada (sinal)."
+    : "Para clareza, firmamos o presente recibo, dando plena e geral quitação do valor acima.";
+  const lq = doc.splitTextToSize(txt(quitacao), W - 2 * M);
+  doc.text(lq, M, y, { lineHeightFactor: 1.5 });
+  y += lq.length * 6 + 12;
+
+  // Local e data por extenso
+  const [ano, mes, dia] = r.data.split("-").map(Number);
+  doc.text(txt(`Fortaleza/CE, ${dia} de ${MESES[mes - 1]} de ${ano}.`), W - M, y, { align: "right" });
+
+  // Assinatura
+  const yA = Math.max(y + 32, 225);
+  const xc = W / 2;
+  // Assinatura desenhada no gerador, apoiada sobre a linha
+  const ass = await assinaturaRecortada();
+  if (ass) {
+    let w = 70, h = w * ass.h / ass.w;
+    if (h > 30) { h = 30; w = h * ass.w / ass.h; }
+    // A base da assinatura passa um pouco da linha, como numa assinatura de caneta
+    doc.addImage(ass.data, "PNG", xc - w / 2, yA - h * 0.82, w, h, "assinatura", "FAST");
+  }
+  doc.setDrawColor(30, 37, 35); doc.setLineWidth(0.3); doc.line(xc - 45, yA, xc + 45, yA);
+  doc.setFont("helvetica", "bold"); doc.setFontSize(10);
+  doc.text(EMPRESA.nome, xc, yA + (ass ? 8 : 5.5), { align: "center" });
+  doc.setFont("helvetica", "normal"); doc.setFontSize(8.5); doc.setTextColor(...CINZA);
+  const sob = [f.vendedor.value.trim(), EMPRESA.linhas.find((l) => l.startsWith("CNPJ"))].filter(Boolean);
+  sob.forEach((l, i) => doc.text(txt(l), xc, yA + (ass ? 13 : 10.5) + i * 4.5, { align: "center" }));
+
+  rodapePDF(doc, r.numero ? `Recibo Nº ${r.numero}` : "Recibo");
+  const nome = `Recibo ${r.numero || ""} - ${f.cliente.value || "cliente"}`.replace(/[\\/:*?"<>|]/g, "").replace(/\s+/g, " ").trim();
+  doc.save(`${nome}.pdf`);
+}
+
+/* Eclipse Cortinas: o recibo sai sem assinatura impressa (a linha fica em branco para
+   assinar à mão). Para ter assinatura padrão como na EDD, ponha a imagem (PNG com fundo
+   transparente) no site e escreva o caminho aqui, ex.: "img/assinatura-recibo.png". */
+const ASSINATURA_RECIBO = "";
+function assinaturaRecortada() {
+  if (!ASSINATURA_RECIBO) return Promise.resolve(null);
+  return imagemParaDataURL(ASSINATURA_RECIBO, 700, "image/png").catch(() => null);
+}
+form.reciboValor.addEventListener("input", () => soValorEmReais(form.reciboValor));
+document.querySelector("#baixar-recibo").addEventListener("click", async () => {
+  const erroRecibo = document.querySelector("#erro-recibo");
+  erroRecibo.hidden = true;
+  form.querySelectorAll(".invalido").forEach((c) => c.classList.remove("invalido"));
+  const r = dadosRecibo();
+  const faltando = [];
+  if (!form.cliente.value.trim()) faltando.push(form.cliente);
+  if (!r.valor) faltando.push(form.reciboValor);
+  if (!r.referente) faltando.push(form.reciboRef);
+  if (faltando.length) {
+    faltando.forEach((c) => c.classList.add("invalido"));
+    erroRecibo.textContent = "Para o recibo, preencha o nome do cliente, o valor recebido e o \"referente a\".";
+    erroRecibo.hidden = false;
+    return;
+  }
+  if (!window.jspdf) { erroRecibo.textContent = "Não foi possível carregar o gerador de PDF. Verifique a internet e tente de novo."; erroRecibo.hidden = false; return; }
+  await gerarRecibo();
 });
 
 /* ---------- Pedido vindo do simulador do site (link #i=...) ---------- */
@@ -613,6 +1243,8 @@ function carregarPedido(pedido) {
       altura: p.h ? numero.format(p.h) : "",
       qtd: String(p.q || 1),
       guia: p.g ? "1" : "",
+      categoria: p.k || "",
+      cor: p.c || "",
       descricao: p.d || (indice < 0 && p.m ? p.m : ""),
     });
   });
@@ -628,12 +1260,14 @@ function carregarPedido(pedido) {
 window.addEventListener("hashchange", () => { if (lerPedidoDoLink()) location.reload(); });
 
 /* ---------- Login ----------
-   Login e senha são conferidos no servidor de acessos (Cloudflare Worker).
-   Nada da senha fica no site. "edduardo" é o administrador. */
+   Login e senha são conferidos no servidor de acessos (Cloudflare Worker), como na EDD.
+   A Eclipse ainda não tem servidor (API_ACESSOS vazio): o gerador abre direto, sem login,
+   e os orçamentos ficam salvos só neste aparelho (veja servidorLocal abaixo).
+   Quando o Worker da Eclipse existir, escreva o endereço dele aqui. */
 const API_ACESSOS = (() => {
   // Só na prévia local dá para apontar para outro servidor (testes)
   try { if (location.hostname === "localhost" && localStorage.getItem("eclipse-api")) return localStorage.getItem("eclipse-api"); } catch (e) {}
-  return "https://eclipse-acessos.CONTA.workers.dev" /* TODO: trocar pelo endereço do Worker da Eclipse */;
+  return "";
 })();
 const CHAVE_ACESSO = "eclipse-orcamento-acesso";
 const formLogin = document.querySelector("#form-login");
@@ -647,6 +1281,7 @@ function apagarAcesso() {
   try { localStorage.removeItem(CHAVE_ACESSO); sessionStorage.removeItem(CHAVE_ACESSO); } catch (e) {}
 }
 async function api(metodo, rota, corpo) {
+  if (!API_ACESSOS) return servidorLocal(metodo, rota, corpo);
   const acesso = lerAcesso();
   const r = await fetch(API_ACESSOS + rota, {
     method: metodo,
@@ -656,13 +1291,101 @@ async function api(metodo, rota, corpo) {
   const dados = await r.json().catch(() => ({}));
   return { ...dados, ok: r.ok, status: r.status };
 }
+/* "Servidor" deste aparelho (sem Worker): guarda os orçamentos no localStorage, com as
+   mesmas respostas do servidor da EDD (lista, abrir, salvar, próximo número, status, arquivar). */
+const CHAVE_SALVOS = "eclipse-orcamentos-salvos";
+const USUARIO_LOCAL = "este aparelho";
+function lerSalvos() {
+  try { return JSON.parse(localStorage.getItem(CHAVE_SALVOS)) || {}; } catch (e) { return {}; }
+}
+function gravarSalvos(salvos) {
+  localStorage.setItem(CHAVE_SALVOS, JSON.stringify(salvos));
+}
+function proximoNumeroLocal(salvos, tipo, data, ignorarId = "") {
+  const base = baseNumero(tipo, data);
+  let maior = 0;
+  Object.entries(salvos).forEach(([id, o]) => {
+    const m = RE_NUMERO.exec(String(o.meta.n || ""));
+    if (id !== ignorarId && m && o.meta.n.startsWith(base)) maior = Math.max(maior, parseInt(m[4], 10));
+  });
+  return base + String(maior + 1).padStart(3, "0");
+}
+async function servidorLocal(metodo, rota, corpo = {}) {
+  const ok = (dados) => ({ ...dados, ok: true, status: 200 });
+  const falha = (status, erro) => ({ ok: false, status, erro });
+  const url = new URL(rota, location.href);
+  const caminho = `${metodo} ${url.pathname}`;
+  let salvos;
+  try { salvos = lerSalvos(); } catch (e) { return falha(500, "Não foi possível ler os orçamentos deste aparelho."); }
+  if (caminho === "GET /eu") return ok({ usuario: USUARIO_LOCAL, adm: false });
+  if (caminho === "GET /orcamentos") {
+    const lista = Object.entries(salvos).map(([id, { meta: m }]) => ({
+      id, numero: m.n, tipo: m.t, cliente: m.c, bairro: m.b, total: m.v, status: m.s,
+      dono: USUARIO_LOCAL, atualizado: m.a, data: m.dt || "", arquivado: !!m.x,
+    }));
+    lista.sort((a, b) => String(b.atualizado).localeCompare(String(a.atualizado)));
+    return ok({ orcamentos: lista });
+  }
+  if (caminho === "GET /proximo-numero") {
+    const p = url.searchParams;
+    return ok({ numero: proximoNumeroLocal(salvos, p.get("tipo"), p.get("data"), p.get("ignorar") || "") });
+  }
+  if (metodo === "GET" && url.pathname.startsWith("/orcamentos/")) {
+    const id = url.pathname.split("/")[2];
+    const o = salvos[id];
+    if (!o) return falha(404, "Orçamento não encontrado.");
+    return ok({ id, status: o.meta.s, dono: USUARIO_LOCAL, arquivado: !!o.meta.x, dados: o.dados });
+  }
+  if (caminho === "POST /orcamentos") {
+    const r = corpo.resumo || {};
+    if (!corpo.dados || typeof corpo.dados !== "object") return falha(400, "Nada para salvar.");
+    let id = String(corpo.id || "");
+    const antes = id ? salvos[id] : null;
+    if (id && !antes) return falha(404, "Orçamento não encontrado.");
+    if (!id) id = Date.now().toString(16) + Math.random().toString(16).slice(2, 8);
+    let numero = String(r.numero || "").trim().slice(0, 20);
+    if (!antes && RE_NUMERO.test(numero) && Object.values(salvos).some((o) => o.meta.n === numero)) numero = "";
+    if (!numero) numero = proximoNumeroLocal(salvos, r.tipo, r.data, id);
+    if (corpo.dados.campos) corpo.dados.campos.numero = numero;
+    salvos[id] = {
+      dados: corpo.dados,
+      meta: {
+        n: numero, t: r.tipo === "Pedido" ? "Pedido" : "Orçamento", c: String(r.cliente || "").slice(0, 80),
+        b: String(r.bairro || "").slice(0, 40), v: Math.round((Number(r.total) || 0) * 100) / 100,
+        s: antes ? antes.meta.s : "Orçamento", a: new Date().toISOString(), x: antes ? antes.meta.x : 0,
+        dt: /^\d{4}-\d{2}-\d{2}$/.test(String(r.data || "")) ? r.data : (antes && antes.meta.dt) || "",
+      },
+    };
+    try { gravarSalvos(salvos); } catch (e) { return falha(507, "Sem espaço neste aparelho para salvar."); }
+    return ok({ id, numero, status: salvos[id].meta.s });
+  }
+  if (caminho === "POST /orcamentos/status" || caminho === "POST /orcamentos/arquivar") {
+    const o = salvos[String(corpo.id || "")];
+    if (!o) return falha(404, "Orçamento não encontrado.");
+    if (caminho.endsWith("/status")) {
+      if (!STATUS.includes(corpo.status)) return falha(400, "Status inválido.");
+      o.meta.s = corpo.status;
+    } else {
+      o.meta.x = corpo.arquivado ? 1 : 0;
+    }
+    o.meta.a = new Date().toISOString();
+    try { gravarSalvos(salvos); } catch (e) { return falha(507, "Sem espaço neste aparelho para salvar."); }
+    return ok({});
+  }
+  return falha(404, "Rota não encontrada.");
+}
 function mostrarErroLogin(texto) {
   loginErro.textContent = texto;
   loginErro.hidden = false;
 }
-function liberar(adm) {
+let usuarioAtual = "";
+function liberar(adm, usuario) {
   document.body.classList.remove("bloqueado");
-  botaoAcessos.hidden = !adm;
+  botaoAcessos.hidden = !adm || !API_ACESSOS;
+  // "Reorganizar numeração" e "Sair" só existem com o servidor de acessos
+  botaoRenumerar.hidden = !adm || !API_ACESSOS;
+  document.querySelector("#sair").hidden = !API_ACESSOS;
+  usuarioAtual = usuario || "";
   iniciar();
 }
 
@@ -686,7 +1409,7 @@ formLogin.addEventListener("submit", async (e) => {
   }
   try { (formLogin.lembrar.checked ? localStorage : sessionStorage).setItem(CHAVE_ACESSO, r.acesso); } catch (err) {}
   formLogin.reset();
-  liberar(r.adm);
+  liberar(r.adm, r.usuario);
 });
 
 document.querySelector("#sair").addEventListener("click", () => {
@@ -719,7 +1442,7 @@ async function carregarAcessos() {
   listaAcessos.innerHTML = "";
   if (!r.ok) return avisoAcessos(r.erro || "Não foi possível carregar a lista.");
   if (!r.usuarios.length) {
-    listaAcessos.innerHTML = '<li class="vazio">Ninguém adicionado ainda. Só você (edduardo) tem acesso.</li>';
+    listaAcessos.innerHTML = '<li class="vazio">Ninguém adicionado ainda. Só o administrador tem acesso.</li>';
     return;
   }
   r.usuarios.forEach((u) => {
@@ -769,6 +1492,414 @@ formAcesso.addEventListener("submit", async (e) => {
   carregarAcessos();
 });
 
+/* ---------- Orçamentos salvos no servidor ----------
+   "Salvar" (e "Baixar PDF") guardam o orçamento no servidor; "Meus orçamentos" lista, busca e reabre.
+   Cada pessoa vê os seus; o administrador vê todos. */
+const STATUS = ["Orçamento", "Aprovado", "Em produção", "Pronto", "Instalado", "Perdido"];
+const painelLista = document.querySelector("#painel-lista");
+const listaOrc = document.querySelector("#lista-orc");
+const listaMsg = document.querySelector("#lista-msg");
+let orcamentosSalvos = [];
+
+function aviso(texto, cor = "#04467A") {
+  erro.textContent = texto;
+  erro.style.color = cor;
+  erro.hidden = !texto;
+}
+function resumoPara(dados, total) {
+  const c = dados.campos || {};
+  return { numero: c.numero, tipo: c.tipo, cliente: c.cliente, bairro: c.bairro, data: c.data, total };
+}
+
+// Guarda no servidor o que está na tela. Devolve true se salvou
+async function salvarNoServidor({ silencioso = false } = {}) {
+  const t = totais();
+  if (!form.cliente.value.trim() && !t.total) {
+    if (!silencioso) aviso("Preencha pelo menos o cliente ou um item antes de salvar.", "");
+    return false;
+  }
+  const dados = dadosAtuais();
+  const r = await api("POST", "/orcamentos", { id: form.idServidor.value, dados, resumo: resumoPara(dados, t.total) })
+    .catch(() => ({ ok: false, erro: "Sem conexão com o servidor. O rascunho continua guardado neste aparelho." }));
+  if (!r.ok) {
+    if (!silencioso) aviso(r.erro || "Não foi possível salvar. Tente de novo.", "");
+    return false;
+  }
+  form.idServidor.value = r.id;
+  carregarClientes(); // cliente novo entra no cadastro
+  // O servidor pode ter trocado o número (outra pessoa usou o mesmo ao mesmo tempo)
+  if (r.numero) form.numero.value = r.numero;
+  salvarRascunho();
+  if (!silencioso) aviso(`${form.tipo.value} nº ${form.numero.value} salvo. Ele aparece em "Meus orçamentos"${API_ACESSOS ? " em qualquer aparelho" : " neste aparelho"}.`);
+  return true;
+}
+document.querySelector("#salvar").addEventListener("click", async (e) => {
+  // Guarda o botão antes do await: depois dele o evento já não sabe qual botão foi
+  const botao = e.currentTarget;
+  botao.disabled = true;
+  await salvarNoServidor();
+  botao.disabled = false;
+});
+
+// Sugere o próximo número do mês e do tipo. Só troca um número vazio, ou um número automático
+// de outro mês ou de outro tipo (ex.: mudou de orçamento para pedido). Número antigo ou digitado à mão fica.
+async function sugerirNumero() {
+  const precisa = () => {
+    const atual = form.numero.value.trim();
+    return !atual || (RE_NUMERO.test(atual) && !atual.startsWith(baseNumero(form.tipo.value, form.data.value)));
+  };
+  if (!precisa()) return;
+  const pedido = `${form.tipo.value}|${form.data.value}`;
+  const p = new URLSearchParams({ tipo: form.tipo.value, data: form.data.value, ignorar: form.idServidor.value });
+  const r = await api("GET", `/proximo-numero?${p}`).catch(() => null);
+  // A resposta chegou depois de outra troca de tipo ou data: vale a mais nova
+  if (!r || !r.ok || !r.numero || pedido !== `${form.tipo.value}|${form.data.value}` || !precisa()) return;
+  form.numero.value = String(r.numero);
+  atualizar();
+  salvarRascunho();
+}
+
+// Primeira vez neste aparelho: manda para o servidor os rascunhos que ficaram guardados aqui
+async function importarRascunhos() {
+  let chaves = [];
+  try { chaves = Object.keys(localStorage).filter((k) => k.startsWith(CHAVE_RASCUNHO)); } catch (e) { return; }
+  for (const chave of chaves) {
+    let r;
+    try { r = JSON.parse(localStorage.getItem(chave)); } catch (e) { continue; }
+    if (!r || !r.campos || r.campos.idServidor) continue;
+    const t = calcularTotais(r.campos, itensComModelo(r.itens));
+    if (!String(r.campos.cliente || "").trim() || !t.total) continue; // rascunho vazio ou incompleto não vai
+    const res = await api("POST", "/orcamentos", { dados: r, resumo: resumoPara(r, t.total) }).catch(() => null);
+    if (!res || !res.ok) return; // sem conexão: tenta de novo na próxima vez
+    r.campos.idServidor = res.id;
+    if (!r.campos.numero) r.campos.numero = res.numero;
+    try { localStorage.setItem(chave, JSON.stringify(r)); } catch (e) {}
+    // Se é o que está aberto na tela, a tela também passa a saber que já foi salvo
+    if (chave === chaveRascunho && !form.idServidor.value) {
+      form.idServidor.value = res.id;
+      if (!form.numero.value.trim()) form.numero.value = res.numero;
+    }
+  }
+}
+
+function avisoLista(texto, ok) {
+  listaMsg.textContent = texto;
+  listaMsg.style.color = ok ? "#1f6b33" : "";
+  listaMsg.hidden = !texto;
+}
+function desenharLista() {
+  // Busca sem diferenciar maiúsculas nem acentos; várias palavras: todas precisam aparecer
+  const simples = (v) => String(v || "").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "");
+  const palavras = simples(document.querySelector("#busca-orc").value).split(/\s+/).filter(Boolean);
+  const tipo = document.querySelector("#filtro-tipo").value;
+  const status = document.querySelector("#filtro-status").value;
+  const verArquivados = document.querySelector("#ver-arquivados").checked;
+  const visiveis = orcamentosSalvos.filter((o) => {
+    const texto = simples([o.cliente, o.numero, o.bairro].join(" "));
+    return o.arquivado === verArquivados &&
+      (!tipo || (o.tipo || "Orçamento") === tipo) &&
+      (!status || o.status === status) &&
+      palavras.every((p) => texto.includes(p));
+  });
+  const soma = visiveis.reduce((t, o) => t + (o.total || 0), 0);
+  document.querySelector("#painel-lista h2").textContent = verArquivados ? "Pedidos/orçamentos desativados" : "Meus orçamentos";
+  document.querySelector("#lista-resumo").textContent = visiveis.length
+    ? `${visiveis.length} ${visiveis.length === 1 ? "item" : "itens"} · ${reais.format(soma)}`
+    : "";
+  listaOrc.innerHTML = "";
+  if (!visiveis.length) {
+    listaOrc.innerHTML = `<li><span class="vazio">${verArquivados && !palavras.length && !tipo && !status ? "Nenhum pedido ou orçamento desativado." : orcamentosSalvos.length ? "Nada encontrado com esse filtro." : 'Nenhum orçamento salvo ainda. Use o botão "Salvar" ou "Baixar PDF".'}</span></li>`;
+    return;
+  }
+  // Separado por mês (o mais recente em cima); dentro do mês, orçamentos e depois pedidos, em ordem crescente
+  ordenarPorMes(visiveis);
+  let mesAtual = null;
+  visiveis.forEach((o) => {
+    if (mesDe(o) !== mesAtual) {
+      mesAtual = mesDe(o);
+      const doMes = visiveis.filter((v) => mesDe(v) === mesAtual);
+      const orcs = doMes.filter((v) => v.tipo !== "Pedido").length;
+      const peds = doMes.length - orcs;
+      const titulo = document.createElement("li");
+      titulo.className = "salvos__mes";
+      titulo.textContent = [nomeMes(mesAtual),
+        orcs ? `${orcs} ${orcs === 1 ? "orçamento" : "orçamentos"}` : "",
+        peds ? `${peds} ${peds === 1 ? "pedido" : "pedidos"}` : ""].filter(Boolean).join(" · ");
+      listaOrc.appendChild(titulo);
+    }
+    const li = document.createElement("li");
+    if (o.arquivado) li.className = "is-arquivado";
+    const titulo = document.createElement("span");
+    titulo.className = "salvos__titulo";
+    // Nome do cliente em destaque; o tipo vem numa etiqueta, para não confundir pedido com orçamento
+    const etiqueta = document.createElement("span");
+    etiqueta.className = `salvos__tipo${o.tipo === "Pedido" ? " salvos__tipo--pedido" : ""}`;
+    // Número novo já diz o tipo (ORC/PED); número antigo leva o nome do tipo na frente
+    etiqueta.textContent = RE_NUMERO.test(o.numero || "") ? o.numero : `${o.tipo || "Orçamento"} nº ${o.numero || "-"}`;
+    titulo.append(etiqueta, document.createTextNode(o.cliente || "sem nome"));
+    const valor = document.createElement("span");
+    valor.className = "salvos__valor";
+    valor.textContent = reais.format(o.total || 0);
+    const info = document.createElement("span");
+    info.className = "salvos__info";
+    info.textContent = [o.bairro, `alterado em ${dataBR(String(o.atualizado || "").slice(0, 10))}`, o.dono !== usuarioAtual && o.dono ? `feito por ${o.dono}` : ""].filter(Boolean).join(" · ");
+
+    const acoes = document.createElement("div");
+    acoes.className = "salvos__acoes";
+    const abrir = botaoLinha("Abrir", () => abrirSalvo(o.id, o.total));
+    const sel = document.createElement("select");
+    sel.setAttribute("aria-label", "Status");
+    sel.innerHTML = STATUS.map((s) => `<option value="${s}"${s === o.status ? " selected" : ""}>${s === "Orçamento" ? "Em aberto" : s}</option>`).join("");
+    sel.addEventListener("change", async () => {
+      const res = await api("POST", "/orcamentos/status", { id: o.id, status: sel.value }).catch(() => ({ ok: false }));
+      if (res.ok) o.status = sel.value;
+      avisoLista(res.ok ? `Nº ${o.numero}: status "${sel.value}".` : res.erro || "Não deu certo, tente de novo.", res.ok);
+      desenharLista();
+    });
+    // "Apagar" não some de vez: vai para "Desativados", de onde dá para restaurar.
+    // O número continua reservado, para não repetir o de um PDF já enviado
+    const arquivar = botaoLinha(o.arquivado ? "Restaurar" : "Apagar", async () => {
+      const nome = `${o.tipo || "Orçamento"} ${o.numero || ""} (${o.cliente || "sem nome"})`;
+      if (!o.arquivado && !confirm(`Apagar ${nome}?\nEle vai para "Desativados" e pode ser restaurado depois.`)) return desenharLista();
+      const res = await api("POST", "/orcamentos/arquivar", { id: o.id, arquivado: !o.arquivado }).catch(() => ({ ok: false }));
+      if (res.ok) o.arquivado = !o.arquivado;
+      avisoLista(res.ok ? `${nome} ${o.arquivado ? 'apagado. Está em "Desativados".' : "restaurado: voltou para a lista."}` : res.erro || "Não deu certo, tente de novo.", res.ok);
+      desenharLista();
+    });
+    const copiar = botaoLinha("Copiar", () => copiarSalvo(o.id));
+    arquivar.classList.add(o.arquivado ? "salvos__restaurar" : "salvos__apagar");
+    acoes.append(abrir, copiar, sel, arquivar);
+    li.append(titulo, valor, info, acoes);
+    listaOrc.appendChild(li);
+  });
+}
+// Mês do documento ("2026-10"): pela data do documento; nos antigos, pelo número ou pela data em que foi salvo
+function mesDe(o) {
+  if (/^\d{4}-\d{2}/.test(o.data || "")) return o.data.slice(0, 7);
+  const m = RE_NUMERO.exec(o.numero || "");
+  if (m) return `20${m[3]}-${m[2]}`;
+  return String(o.atualizado || "").slice(0, 7) || "0000-00";
+}
+function nomeMes(mes) {
+  const [a, m] = mes.split("-").map(Number);
+  if (!a || !m) return "Sem data";
+  const nome = new Date(a, m - 1, 1).toLocaleDateString("pt-BR", { month: "long", year: "numeric" });
+  return nome.charAt(0).toUpperCase() + nome.slice(1);
+}
+function ordenarPorMes(lista) {
+  const seq = (o) => { const m = RE_NUMERO.exec(o.numero || ""); return m ? parseInt(m[4], 10) : parseInt(o.numero, 10) || 0; };
+  const tipo = (o) => (o.tipo === "Pedido" ? 1 : 0);
+  lista.sort((a, b) => mesDe(b).localeCompare(mesDe(a)) || tipo(a) - tipo(b) || seq(a) - seq(b) ||
+    String(a.data || "").localeCompare(String(b.data || "")) || String(a.atualizado).localeCompare(String(b.atualizado)));
+}
+
+/* Reorganizar a numeração dos já salvos (só o administrador): mostra como fica e pede confirmação */
+const botaoRenumerar = document.querySelector("#renumerar");
+botaoRenumerar.addEventListener("click", async () => {
+  botaoRenumerar.disabled = true;
+  avisoLista("Calculando a nova numeração...", true);
+  const previa = await api("POST", "/orcamentos/renumerar", { aplicar: false }).catch(() => ({ ok: false, erro: "Sem conexão com o servidor." }));
+  botaoRenumerar.disabled = false;
+  if (!previa.ok) return avisoLista(previa.erro === "Rota não encontrada." ? "O servidor ainda não foi atualizado para a nova numeração." : previa.erro || "Não deu certo, tente de novo.");
+  if (!previa.mudancas.length) return avisoLista("A numeração já está em ordem. Nada para mudar.", true);
+  const linhas = previa.mudancas.slice(0, 12).map((m) => `${m.de || "(sem nº)"} -> ${m.para}  ${m.cliente}`);
+  if (previa.mudancas.length > 12) linhas.push(`... e mais ${previa.mudancas.length - 12}`);
+  const ok = confirm(`Reorganizar a numeração de ${previa.mudancas.length} de ${previa.total} documentos?\n` +
+    "Cada mês recomeça do 001, separado para orçamento (ORC) e pedido (PED), em ordem de data.\n\n" +
+    linhas.join("\n") +
+    "\n\nAtenção: PDFs que já foram enviados a clientes continuam com o número antigo.");
+  if (!ok) return avisoLista("");
+  botaoRenumerar.disabled = true;
+  avisoLista("Aplicando...", true);
+  const r = await api("POST", "/orcamentos/renumerar", { aplicar: true }).catch(() => ({ ok: false, erro: "Sem conexão com o servidor." }));
+  botaoRenumerar.disabled = false;
+  if (!r.ok) return avisoLista(r.erro || "Não deu certo, tente de novo.");
+  // O documento aberto na tela também recebe o número novo
+  const doAberto = r.mudancas.find((m) => m.id === form.idServidor.value);
+  if (doAberto) { form.numero.value = doAberto.para; atualizar(); salvarRascunho(); }
+  // Um novo ainda não salvo pede outra vez o número, que pode ter sido usado pela reorganização
+  if (!form.idServidor.value && RE_NUMERO.test(form.numero.value.trim())) { form.numero.value = ""; await sugerirNumero(); }
+  await carregarLista();
+  avisoLista(`Pronto: ${r.mudancas.length} ${r.mudancas.length === 1 ? "documento renumerado" : "documentos renumerados"}.`, true);
+});
+
+async function carregarLista() {
+  listaOrc.innerHTML = '<li><span class="vazio">Carregando...</span></li>';
+  const r = await api("GET", "/orcamentos").catch(() => ({ ok: false, erro: "Sem conexão com o servidor." }));
+  if (!r.ok) { listaOrc.innerHTML = ""; return avisoLista(r.erro || "Não foi possível carregar a lista."); }
+  orcamentosSalvos = r.orcamentos;
+  montarClientes(orcamentosSalvos);
+  desenharLista();
+}
+/* ---------- Cadastro de clientes ----------
+   Vem dos orçamentos e pedidos já salvos no servidor (os seus; o administrador vê de todos).
+   Um cliente por nome; vale o documento mais recente dele. Escolher copia nome, CPF/CNPJ,
+   endereço, bairro, cidade, CEP e telefone para o orçamento que está na tela. */
+const buscaCliente = document.querySelector("#busca-cliente");
+const listaClientes = document.querySelector("#lista-clientes");
+const dicaCliente = document.querySelector("#dica-cliente");
+const DICA_CLIENTE = dicaCliente.textContent;
+const CAMPOS_CLIENTE = ["cliente", "documento", "endereco", "bairro", "cidade", "cep", "telefone"];
+let clientes = [];
+let marcadoCliente = -1;
+const semAcento = (t) => String(t || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/\s+/g, " ").trim();
+
+function montarClientes(lista) {
+  const porNome = new Map();
+  lista.forEach((o) => {
+    const chave = semAcento(o.cliente);
+    if (!chave) return;
+    const c = porNome.get(chave);
+    if (!c) porNome.set(chave, { nome: o.cliente.trim(), bairro: o.bairro || "", id: o.id, numero: o.numero, data: o.data, quando: String(o.atualizado || ""), qtd: 1 });
+    else {
+      c.qtd++;
+      // Fica com o documento mais recente (dados mais atualizados do cliente)
+      if (String(o.atualizado || "") > c.quando) Object.assign(c, { nome: o.cliente.trim(), bairro: o.bairro || c.bairro, id: o.id, numero: o.numero, data: o.data, quando: String(o.atualizado || "") });
+    }
+  });
+  clientes = [...porNome.values()].sort((a, b) => a.nome.localeCompare(b.nome, "pt-BR"));
+}
+async function carregarClientes() {
+  const r = await api("GET", "/orcamentos").catch(() => null);
+  if (r && r.ok && Array.isArray(r.orcamentos)) montarClientes(r.orcamentos);
+}
+function fecharClientes() {
+  listaClientes.hidden = true;
+  buscaCliente.setAttribute("aria-expanded", "false");
+  marcadoCliente = -1;
+}
+function mostrarClientes() {
+  const palavras = semAcento(buscaCliente.value).split(" ").filter(Boolean);
+  if (!palavras.length) return fecharClientes();
+  const achados = clientes.filter((c) => {
+    const texto = semAcento(`${c.nome} ${c.bairro}`);
+    return palavras.every((p) => texto.includes(p));
+  })
+    // Primeiro quem tem o nome começando pelo que foi digitado
+    .sort((a, b) => Number(!semAcento(a.nome).startsWith(palavras[0])) - Number(!semAcento(b.nome).startsWith(palavras[0])))
+    .slice(0, 8);
+  listaClientes.replaceChildren();
+  if (!achados.length) {
+    const li = document.createElement("li");
+    li.className = "vazio";
+    li.textContent = clientes.length ? "Nenhum cliente com esse nome. Preencha abaixo como cliente novo." : "Ainda não há clientes salvos.";
+    listaClientes.appendChild(li);
+  }
+  achados.forEach((c, i) => {
+    const li = document.createElement("li");
+    li.setAttribute("role", "option");
+    li.id = `cliente-op-${i}`;
+    const nome = document.createElement("span");
+    nome.className = "busca-cliente__nome";
+    nome.textContent = c.nome;
+    const info = document.createElement("span");
+    info.className = "busca-cliente__info";
+    info.textContent = [c.bairro, `${c.qtd} ${c.qtd === 1 ? "documento" : "documentos"}`].filter(Boolean).join(" · ");
+    li.append(nome, info);
+    // mousedown: escolhe antes de o campo perder o foco e a lista fechar
+    li.addEventListener("mousedown", (e) => { e.preventDefault(); escolherCliente(c); });
+    listaClientes.appendChild(li);
+  });
+  marcadoCliente = achados.length ? 0 : -1;
+  marcarCliente();
+  listaClientes.hidden = false;
+  buscaCliente.setAttribute("aria-expanded", "true");
+}
+function marcarCliente() {
+  const ops = listaClientes.querySelectorAll('[role="option"]');
+  ops.forEach((li, i) => li.setAttribute("aria-selected", i === marcadoCliente ? "true" : "false"));
+  if (ops[marcadoCliente]) {
+    buscaCliente.setAttribute("aria-activedescendant", ops[marcadoCliente].id);
+    ops[marcadoCliente].scrollIntoView({ block: "nearest" });
+  } else buscaCliente.removeAttribute("aria-activedescendant");
+}
+async function escolherCliente(c) {
+  fecharClientes();
+  buscaCliente.value = c.nome;
+  dicaCliente.classList.remove("ok");
+  dicaCliente.textContent = "Buscando os dados do cliente...";
+  const r = await api("GET", `/orcamentos/${c.id}`).catch(() => null);
+  const campos = r && r.ok && r.dados && r.dados.campos;
+  if (!campos) {
+    dicaCliente.textContent = "Não foi possível buscar os dados agora. Confira a internet e tente de novo.";
+    return;
+  }
+  CAMPOS_CLIENTE.forEach((k) => { if (form[k]) form[k].value = campos[k] || (k === "cidade" ? form[k].value : ""); });
+  form.cliente.classList.remove("invalido");
+  atualizar();
+  salvarRascunho();
+  buscaCliente.value = "";
+  dicaCliente.textContent = `Dados de ${c.nome} preenchidos (do ${campos.numero || c.numero || "último documento"}${campos.data ? `, de ${dataBR(campos.data)}` : ""}). Confira se algo mudou.`;
+  dicaCliente.classList.add("ok");
+}
+buscaCliente.addEventListener("input", (e) => { e.stopPropagation(); mostrarClientes(); });
+buscaCliente.addEventListener("focus", () => { if (buscaCliente.value.trim()) mostrarClientes(); });
+buscaCliente.addEventListener("blur", fecharClientes);
+buscaCliente.addEventListener("keydown", (e) => {
+  const ops = listaClientes.querySelectorAll('[role="option"]');
+  if (e.key === "ArrowDown" && ops.length) { e.preventDefault(); marcadoCliente = (marcadoCliente + 1) % ops.length; marcarCliente(); }
+  else if (e.key === "ArrowUp" && ops.length) { e.preventDefault(); marcadoCliente = (marcadoCliente - 1 + ops.length) % ops.length; marcarCliente(); }
+  else if (e.key === "Enter") {
+    // Enter nunca envia o formulário (baixar PDF) a partir da busca
+    e.preventDefault();
+    const achado = !listaClientes.hidden && ops[marcadoCliente];
+    if (achado) achado.dispatchEvent(new MouseEvent("mousedown", { cancelable: true }));
+  } else if (e.key === "Escape") fecharClientes();
+});
+// Mexeu no nome à mão depois de puxar do cadastro: volta a dica normal
+form.cliente.addEventListener("input", () => { if (dicaCliente.classList.contains("ok")) { dicaCliente.classList.remove("ok"); dicaCliente.textContent = DICA_CLIENTE; } });
+
+// Abre um orçamento salvo: ele passa a ter o próprio rascunho neste aparelho
+async function abrirSalvo(id, totalSalvo) {
+  const r = await api("GET", `/orcamentos/${id}`).catch(() => ({ ok: false, erro: "Sem conexão com o servidor." }));
+  if (!r.ok) { desenharLista(); return avisoLista(r.erro || "Não foi possível abrir."); }
+  chaveRascunho = `${CHAVE_RASCUNHO}-s-${id}`;
+  history.replaceState(null, "", location.pathname);
+  aplicarDados(r.dados);
+  form.idServidor.value = id;
+  atualizar();
+  painelLista.close();
+  aviso(`${form.tipo.value} nº ${form.numero.value} aberto. Depois de alterar, clique em "Salvar".`);
+  // Orçamento salvo antes de os itens guardarem o preço: recalculado com a tabela de hoje pode dar outro total
+  const agora = totais().total;
+  if (totalSalvo && Math.abs(agora - totalSalvo) > 0.01) {
+    aviso(`Atenção: este ${form.tipo.value.toLowerCase()} foi salvo com total de ${reais.format(totalSalvo)}, ` +
+      `mas com a tabela de preços de hoje deu ${reais.format(agora)}. Confira os valores dos itens antes de enviar ` +
+      `(se precisar, use o "Valor unitário" de cada item).`, "#a3261b");
+  }
+  window.scrollTo({ top: 0 });
+}
+// Copia um orçamento salvo para um novo, com o próximo número e a data de hoje. O original não muda
+async function copiarSalvo(id) {
+  const r = await api("GET", `/orcamentos/${id}`).catch(() => ({ ok: false, erro: "Sem conexão com o servidor." }));
+  if (!r.ok) { desenharLista(); return avisoLista(r.erro || "Não foi possível copiar."); }
+  const fechado = fecharAtual();
+  aplicarDados(r.dados);
+  const origem = form.numero.value;
+  form.idServidor.value = "";
+  form.numero.value = "";
+  form.data.value = hoje();
+  form.validade.value = somarDias(form.data.value, VALIDADE_DIAS);
+  form.previsao.value = "";
+  form.previsaoAuto.value = "1";
+  // A cópia é um orçamento novo, de hoje: usa os preços da tabela de hoje
+  listaItens.querySelectorAll('[data-campo="precoBase"]').forEach((c) => { c.value = ""; });
+  await numerarNovo(fechado);
+  painelLista.close();
+  aviso(`Cópia do nº ${origem} aberta como nº ${form.numero.value || "novo"}. Altere o que precisar e clique em "Salvar".`);
+  window.scrollTo({ top: 0 });
+}
+
+document.querySelector("#abrir-lista").addEventListener("click", () => {
+  avisoLista("");
+  painelLista.showModal();
+  carregarLista();
+});
+document.querySelector("#fechar-lista").addEventListener("click", () => painelLista.close());
+["#busca-orc", "#filtro-tipo", "#filtro-status", "#ver-arquivados"].forEach((s) => {
+  document.querySelector(s).addEventListener("input", desenharLista);
+});
+
 /* ---------- Início (só depois do login) ---------- */
 let iniciado = false;
 async function iniciar() {
@@ -786,26 +1917,26 @@ async function iniciar() {
     erro.style.color = "#04467A";
     erro.hidden = false;
   } else if (r && r.campos) {
-    Object.entries(r.campos).forEach(([k, v]) => {
-      const c = form[k];
-      if (!c || c.type === "file") return;
-      if (c.type === "checkbox") c.checked = v === true;
-      else c.value = v;
-    });
-    // Rascunho de antes do desconto em %: o desconto dele era em R$
-    if (!("descontoTipo" in r.campos)) form.descontoTipo.value = "R$";
-    (r.itens && r.itens.length ? r.itens : [{}]).forEach(({ nome, ...d }) => {
-      if (nome) { const i = MODELOS.findIndex((m) => m.nome === nome); d.modelo = i >= 0 ? String(i) : ""; }
-      adicionarItem(d);
-    });
+    aplicarDados(r);
   } else {
     novoOrcamento();
   }
   if (!form.consideracoes.value) form.consideracoes.value = CONSIDERACOES_PADRAO;
   if (!form.data.value) form.data.value = hoje();
   atualizar();
+  // Primeiro sobem os rascunhos antigos (a numeração acompanha), depois vem a sugestão do próximo nº
+  importarRascunhos().then(sugerirNumero).then(carregarClientes);
 }
 
-// Versão de teste: abre direto, sem login (o servidor de acessos ainda não foi configurado).
-// Os orçamentos ficam salvos só neste aparelho.
-liberar(false);
+// Já entrou antes neste aparelho? Confirma com o servidor (vale bloqueio na hora)
+(async () => {
+  // Sem servidor de acessos (versão de teste da Eclipse): abre direto, sem login
+  if (!API_ACESSOS) return liberar(false, USUARIO_LOCAL);
+  if (!lerAcesso()) return formLogin.usuario.focus();
+  const r = await api("GET", "/eu").catch(() => null);
+  if (r && r.ok) return liberar(r.adm, r.usuario);
+  apagarAcesso();
+  if (!r) mostrarErroLogin("Sem conexão com o servidor. Confira a internet e tente de novo.");
+  else if (r.status === 401) mostrarErroLogin("Entre novamente.");
+  formLogin.usuario.focus();
+})();
